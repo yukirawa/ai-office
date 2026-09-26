@@ -51,6 +51,7 @@ type officeStateMsg struct {
 	Employees     []employeeWire     `json:"employees"`
 	Ledger        map[string]int     `json:"ledger"`
 	Relationships []relationshipWire `json:"relationships"`
+	Tasks         []taskWire         `json:"tasks"`
 	TS            string             `json:"ts"`
 }
 
@@ -69,6 +70,16 @@ type relationshipWire struct {
 	ToID     string `json:"to_id"`
 	Affinity int    `json:"affinity"`
 	Trust    int    `json:"trust"`
+}
+
+// taskWire は office_state.tasks[] の 1 要素（TUI のタスクペイン用）。
+type taskWire struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Status   string `json:"status"`
+	Assignee string `json:"assignee"`
+	Mode     string `json:"mode"`
+	Result   string `json:"result"`
 }
 
 // envelope は「type」だけを先読みするための最小の受信メッセージ。

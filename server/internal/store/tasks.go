@@ -74,6 +74,26 @@ func (s *Store) UpdateTask(id, status, result string) error {
 	return nil
 }
 
+// SetTaskAssignee は assignee を更新し、updated_at を現在時刻にする。
+// 対象が無ければ sql.ErrNoRows をラップしたエラー。
+func (s *Store) SetTaskAssignee(id, assignee string) error {
+	res, err := s.db.Exec(
+		`UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?`,
+		assignee, formatTime(nowUTC()), id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: set task assignee %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: set task assignee %s rows: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: set task assignee %s: %w", id, sql.ErrNoRows)
+	}
+	return nil
+}
+
 // Task は 1 件返す。無ければ sql.ErrNoRows をラップしたエラー。
 func (s *Store) Task(id string) (Task, error) {
 	row := s.db.QueryRow(`SELECT `+taskColumns+` FROM tasks WHERE id = ?`, id)

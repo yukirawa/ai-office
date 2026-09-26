@@ -21,6 +21,7 @@ const (
 	defaultHeartbeatTimeout = 90 * time.Second
 	defaultPayrollCron      = "0 9 * * *"
 	defaultPayrollTimezone  = "Asia/Tokyo"
+	defaultChatCron         = "0 * * * *"
 	defaultLLMProvider      = "mock"
 	defaultLLMModel         = "claude-3-5-haiku-latest"
 	defaultAnthropicBaseURL = "https://api.anthropic.com"
@@ -61,6 +62,8 @@ type Config struct {
 	PayrollCron string
 	// PayrollTimezone は cron のタイムゾーン（env OFFICE_PAYROLL_TZ）。
 	PayrollTimezone string
+	// ChatCron は雑談 cron 式（env OFFICE_CHAT_CRON）。"off" で無効（§8 4.4）。
+	ChatCron string
 	// LLMProvider は "mock" または "anthropic"（env OFFICE_LLM_PROVIDER）。
 	LLMProvider string
 	// LLMModel は LLM のモデル名（env OFFICE_LLM_MODEL）。
@@ -137,6 +140,7 @@ func Load() (*Config, error) {
 		HeartbeatTimeout:     heartbeat,
 		PayrollCron:          stringEnv("OFFICE_PAYROLL_CRON", defaultPayrollCron),
 		PayrollTimezone:      stringEnv("OFFICE_PAYROLL_TZ", defaultPayrollTimezone),
+		ChatCron:             stringEnv("OFFICE_CHAT_CRON", defaultChatCron),
 		LLMProvider:          stringEnv("OFFICE_LLM_PROVIDER", defaultLLMProvider),
 		LLMModel:             stringEnv("OFFICE_LLM_MODEL", defaultLLMModel),
 		AnthropicAPIKey:      apiKey,
@@ -157,6 +161,16 @@ func Load() (*Config, error) {
 // GitHubEnabled は GitHub App 連携に必要な設定が揃っているかを返す。
 func (c *Config) GitHubEnabled() bool {
 	return c.GitHubAppID > 0 && c.GitHubInstallationID > 0 && strings.TrimSpace(c.GitHubPrivateKeyPEM) != ""
+}
+
+// ChatCronEnabled は雑談 cron が有効かを返す。空文字・"off"/"none"/"disabled" は無効。
+func (c *Config) ChatCronEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(c.ChatCron)) {
+	case "", "off", "none", "disabled":
+		return false
+	default:
+		return true
+	}
 }
 
 // stringEnv は環境変数を読み、空文字なら既定値を返す。

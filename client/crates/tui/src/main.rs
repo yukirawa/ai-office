@@ -291,6 +291,20 @@ async fn connect_and_collect(cfg: &Config, app: &mut App, duration: Duration) ->
     Ok(())
 }
 
+/// スナップショット出力用のタスク行（新しい順、最大5件）。
+fn task_summary_lines(tasks: &[TaskInfo]) -> Vec<String> {
+    tasks
+        .iter()
+        .take(5)
+        .map(|t| {
+            format!(
+                "  - status={} assignee={} mode={} title={}",
+                t.status, t.assignee, t.mode, t.title
+            )
+        })
+        .collect()
+}
+
 fn print_summary(cfg: &Config, app: &App) {
     println!("=== ai-office TUI snapshot ===");
     println!("server: {}", cfg.url);
@@ -338,16 +352,13 @@ fn print_summary(cfg: &Config, app: &App) {
     }
 
     // tasks は新しい順なので先頭から最大5件を「last」として出す。
-    let tasks: Vec<&TaskInfo> = app.tasks.iter().take(5).collect();
-    println!("tasks (last {}):", tasks.len());
-    if tasks.is_empty() {
+    let task_lines = task_summary_lines(&app.tasks);
+    println!("tasks (last {}):", task_lines.len());
+    if task_lines.is_empty() {
         println!("  (なし)");
     } else {
-        for t in tasks {
-            println!(
-                "  - status={} assignee={} mode={} title={}",
-                t.status, t.assignee, t.mode, t.title
-            );
+        for line in task_lines {
+            println!("{line}");
         }
     }
 
@@ -566,8 +577,8 @@ fn draw_employees(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_tasks(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title("タスク");
     let inner = block.inner(area);
-    // 枠線の内側の幅（プレフィックス分を差し引いておく）。
-    let max_chars = (inner.width as usize).saturating_sub(1);
+    // 枠線の内側の表示幅（全角は幅2で数える）。
+    let max_width = inner.width as usize;
 
     let items: Vec<ListItem> = if app.tasks.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
@@ -587,7 +598,7 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &App) {
                 };
                 // 例: "✔done レポート作成 (dev_m)"。ペイン幅に収まるよう切り詰める。
                 let text = format!("{prefix}{label} {} ({})", t.title, t.assignee);
-                let text = truncate_to_width(&text, max_chars);
+                let text = truncate_to_width(&text, max_width);
                 ListItem::new(Line::from(Span::styled(text, Style::default().fg(color))))
             })
             .collect()
@@ -756,7 +767,8 @@ fn env_string(key: &str, default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ConnectionStatus, backoff_delay, status_display, task_status_prefix, truncate_to_width,
+        App, ConnectionStatus, backoff_delay, status_display, task_status_prefix,
+        task_summary_lines, truncate_to_width,
     };
     use protocol::{EmployeeInfo, ServerMsg, TaskInfo};
     use std::collections::BTreeMap;
@@ -772,6 +784,17 @@ mod tests {
             mode: "local".to_string(),
             result: String::new(),
         }
+    }
+
+    #[test]
+    fn task_summary_lines_format_matches_snapshot_spec() {
+        let tasks = vec![task("t1", "A", "working", "dev_m")];
+        assert_eq!(
+            task_summary_lines(&tasks),
+            vec!["  - status=working assignee=dev_m mode=local title=A"]
+        );
+        // 空なら行なし（呼び側で (なし) を出す）。
+        assert!(task_summary_lines(&[]).is_empty());
     }
 
     #[test]
@@ -905,11 +928,27 @@ mod tests {
         assert!(label.contains("接続が切れました"));
     }
 
-    #[test]
-    fn draw_renders_panes_without_panicking() {
+    /// テスト用に TUI を描画してプレーンテキスト化する。
+    fn render_to_string(app: &App, width: u16, height: u16) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| super::draw(frame, app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut view = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                view.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            view.push('\n');
+        }
+        view
+    }
+
+    #[test]
+    fn draw_renders_panes_without_panicking() {
         let mut app = App::default();
         app.apply(&ServerMsg::OfficeState {
             online: vec!["mgr".to_string(), "dev_m".to_string()],
@@ -950,17 +989,7 @@ mod tests {
         });
         app.status = ConnectionStatus::Connected;
 
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
-
-        let buf = terminal.backend().buffer();
-        let mut view = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                view.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
-            }
-            view.push('\n');
-        }
+        let view = render_to_string(&app, 100, 30);
         // 全角文字は TestBackend 上で幅2のセル + 埋め草になるため、空白を除いて照合する。
         let compact: String = view.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(compact.contains("社員"), "{view}");
@@ -975,5 +1004,15 @@ mod tests {
         assert!(compact.contains("mgr:今日のタスクは…"), "{view}");
         assert!(compact.contains('●'), "{view}");
         assert!(compact.contains('○'), "{view}");
+    }
+
+    #[test]
+    fn draw_shows_empty_tasks_placeholder() {
+        // タスクが無いときはタスクペインに (なし) を出す。
+        let app = App::default();
+        let view = render_to_string(&app, 100, 30);
+        let compact: String = view.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("タスク"), "{view}");
+        assert!(compact.contains("(なし)"), "{view}");
     }
 }

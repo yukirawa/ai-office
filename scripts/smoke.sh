@@ -36,6 +36,7 @@ OFFICE_DB="${OUT}/office.db" \
 OFFICE_ADDR="127.0.0.1:${PORT}" \
 OFFICE_LLM_PROVIDER="mock" \
 OFFICE_PAYROLL_CRON="@every 5s" \
+OFFICE_CHAT_CRON="@every 5s" \
 "${OUT}/officed" > "${OUT}/server.log" 2>&1 &
 SRV_PID=$!
 sleep 1
@@ -73,6 +74,14 @@ echo "== worker が実際に書いたファイル（Phase 2.1 Local モード）
 find "${OUT}/ws" -type f | sort
 echo "-- report の中身 --"
 find "${OUT}/ws" -name '*.md' -exec cat {} \;
+
+echo "== POST /api/chat (Phase 4.3: chat 役が応答) =="
+curl -fsS -X POST "${HTTP}/api/chat" -H 'Content-Type: application/json' \
+  -d '{"message":"おはよう。今日の様子はどう？"}'; echo
+sleep 2
+
+echo "== TUI snapshot (Phase 4: タスク/雑談/関係値) =="
+OFFICE_SERVER_URL="${BASE}" "${ROOT}/client/target/debug/tui" --snapshot
 
 echo "== TUI snapshot (タスク投入後) =="
 OFFICE_SERVER_URL="${BASE}" "${ROOT}/client/target/debug/tui" --snapshot

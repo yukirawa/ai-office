@@ -102,6 +102,8 @@ func run() error {
 	)
 	mgr.SetAssignees(devM, devF)
 	mgr.SetTaskUpdater(srv)
+	// Phase 4.2: 関係値（persona.Service は agents.RelationshipUpdater を満たす）。
+	mgr.SetRelationships(persona.NewService(st))
 	srv.SetManager(mgr)
 
 	// ---- GitHub 連携（Phase 3） ----
@@ -126,6 +128,16 @@ func run() error {
 		logger.Info("GitHub 連携は無効です（GITHUB_APP_ID / GITHUB_INSTALLATION_ID / 秘密鍵が未設定）")
 	}
 
+	// ---- 雑談役（Phase 4.3。Ollama は使わずサーバーの LLM で応答する） ----
+	chat := agents.NewChatAgent(
+		config.EmployeeChatID,
+		loadPersona(st, config.EmployeeChatID, logger),
+		client,
+		srv,
+		agentOptions(cfg, logger),
+	)
+	srv.SetChat(chat)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -134,10 +146,15 @@ func run() error {
 	go mgr.Run(ctx)
 	go devM.Run(ctx)
 	go devF.Run(ctx)
+	go chat.Run(ctx)
 
 	// ---- 日割り給与 cron（Phase 1.4） ----
 	cronScheduler := startPayrollCron(ctx, cfg, st, econ, srv, logger)
 	defer cronScheduler.Stop()
+
+	// ---- 雑談 cron（Phase 4.4） ----
+	chatScheduler := startChatCron(ctx, cfg, chat, logger)
+	defer chatScheduler.Stop()
 
 	// ---- HTTP / WebSocket ----
 	httpServer := &http.Server{
@@ -290,6 +307,35 @@ func startPayrollCron(
 	}
 	c.Start()
 	logger.Info("日割り給与 cron を開始しました", "cron", cfg.PayrollCron, "tz", loc.String())
+	return c
+}
+
+// startChatCron は雑談 cron を開始する（Phase 4.4）。
+// OFFICE_CHAT_CRON が off/空なら登録しない。
+func startChatCron(
+	ctx context.Context,
+	cfg *config.Config,
+	chat *agents.ChatAgent,
+	logger *slog.Logger,
+) *cron.Cron {
+	c := cron.New()
+	if !cfg.ChatCronEnabled() {
+		logger.Info("雑談 cron は無効です", "cron", cfg.ChatCron)
+		return c
+	}
+
+	_, err := c.AddFunc(cfg.ChatCron, func() {
+		if !chat.Post("（雑談を一言お願いします。今のオフィスの様子でも構いません）") {
+			logger.Warn("雑談 cron: chat 役の受信箱が満杯です")
+		}
+	})
+	if err != nil {
+		logger.Error("雑談 cron の登録に失敗しました", "cron", cfg.ChatCron, "error", err)
+		return c
+	}
+	c.Start()
+	logger.Info("雑談 cron を開始しました", "cron", cfg.ChatCron)
+	_ = ctx
 	return c
 }
 

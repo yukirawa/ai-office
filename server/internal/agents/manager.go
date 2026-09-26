@@ -377,6 +377,12 @@ func (m *Manager) handleTask(ctx context.Context, t Task) {
 	m.setState(StateIdle)
 }
 
+// taskAssigner は任意実装。tasks.assignee を更新できる場合に使う（api が実装）。
+// 必須のインターフェースにしないのは、テスト用の TaskUpdater 実装を壊さないため。
+type taskAssigner interface {
+	AssignTask(ctx context.Context, taskID, assignee string) error
+}
+
 // assignTask は計画済みタスクを次の dev に割り当てる。
 func (m *Manager) assignTask(ctx context.Context, t Task, plan string) {
 	assignee := m.nextAssignee()
@@ -389,6 +395,12 @@ func (m *Manager) assignTask(ctx context.Context, t Task, plan string) {
 	task := t
 	task.Plan = plan
 	task.Assignee = assignee.ID()
+	// tasks.assignee を実行担当に更新する（任意実装のため型アサーションで呼ぶ）。
+	if a, ok := m.taskUpdater().(taskAssigner); ok {
+		if err := a.AssignTask(ctx, t.ID, assignee.ID()); err != nil {
+			m.logger().Error("担当者の記録に失敗しました", "task_id", t.ID, "error", err)
+		}
+	}
 	m.updateTask(ctx, t.ID, "assigned", plan)
 	if !assignee.Post(task) {
 		m.updateTask(ctx, t.ID, "failed", "assignee inbox full")

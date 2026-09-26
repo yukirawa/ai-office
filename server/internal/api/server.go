@@ -48,6 +48,7 @@ type Server struct {
 
 	mu          sync.RWMutex
 	manager     *agents.Manager
+	chat        *agents.ChatAgent
 	agentStates map[string]string
 	ghClient    gh.Client
 
@@ -140,6 +141,7 @@ func (s *Server) snapshot(ctx context.Context) officeStateMsg {
 		Employees:     []employeeWire{},
 		Ledger:        map[string]int{},
 		Relationships: []relationshipWire{},
+		Tasks:         []taskWire{},
 		TS:            formatTS(time.Now().UTC()),
 	}
 
@@ -187,6 +189,22 @@ func (s *Server) snapshot(ctx context.Context) officeStateMsg {
 			})
 		}
 	}
+
+	// TUI のタスクペイン用に直近タスクを載せる（Phase 4 の TUI 拡張）。
+	if tasks, err := s.store.Tasks("", snapshotTaskLimit); err != nil {
+		s.log.Warn("タスク一覧の取得に失敗しました", "error", err)
+	} else {
+		for _, t := range tasks {
+			msg.Tasks = append(msg.Tasks, taskWire{
+				ID:       t.ID,
+				Title:    t.Title,
+				Status:   t.Status,
+				Assignee: t.Assignee,
+				Mode:     t.Mode,
+				Result:   t.Result,
+			})
+		}
+	}
 	return msg
 }
 
@@ -215,6 +233,9 @@ func (s *Server) Handler() http.Handler {
 	// オーナーからのタスク投入（Phase 2 で実行まで配線）
 	r.Post("/api/tasks", s.handleCreateTask)
 	r.Get("/api/tasks", s.handleListTasks)
+
+	// オーナーの発言に chat 役が応答する（Phase 4.3）
+	r.Post("/api/chat", s.handleChat)
 
 	// §4.3 /webhook/github
 	// Phase 3: 署名検証してタスク化する。secret は cfg（env GITHUB_WEBHOOK_SECRET）。
@@ -395,6 +416,9 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- ヘルパ ----
+
+// snapshotTaskLimit は office_state に載せるタスクの件数。
+const snapshotTaskLimit = 10
 
 // formatTS は時刻を RFC3339 UTC 文字列にする（§4 の ts 表記）。
 func formatTS(t time.Time) string {
