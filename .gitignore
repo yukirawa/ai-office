@@ -1,0 +1,30 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Go
+server/officed
+server/*.test
+*.exe
+
+# 環境・シークレット
+.env
+.env.local
+secrets/
+*.pem
+*.key
+
+# DB・ログ
+*.db
+*.db-journal
+*.log
+server/data/
+
+# エディタ・OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
