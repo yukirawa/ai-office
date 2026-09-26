@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+# start-client: クライアント側（worker + TUI）を起動するショートカット。
+# scripts/client.sh を呼ぶだけ。リポジトリ直下でも ~/.local/bin からでも動く。
+# 先に別ターミナルで start-server を起動しておく。
+#
+#   ./start-client
+#   OFFICE_SERVER_URL=ws://100.x.y.z:8787/ws ./start-client   # 別ホストの鯖へ
+set -eu
+
+self="$0"
+if command -v readlink >/dev/null 2>&1; then
+  resolved=$(readlink -f "$self" 2>/dev/null || true)
+  [ -n "$resolved" ] && self="$resolved"
+fi
+ROOT="$(cd "$(dirname "$self")" && pwd)"
+
+exec "$ROOT/scripts/client.sh"

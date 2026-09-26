@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+# start-server: サーバー側（officed）を起動するショートカット。
+# scripts/server.sh を呼ぶだけ。リポジトリ直下でも ~/.local/bin からでも動く。
+# 設定はプロジェクトルートの .env から officed が自動で読み込む。
+#
+#   ./start-server
+#   OFFICE_ADDR=127.0.0.1:9000 ./start-server   # 一時的な上書き
+set -eu
+
+self="$0"
+if command -v readlink >/dev/null 2>&1; then
+  resolved=$(readlink -f "$self" 2>/dev/null || true)
+  [ -n "$resolved" ] && self="$resolved"
+fi
+ROOT="$(cd "$(dirname "$self")" && pwd)"
+
+exec "$ROOT/scripts/server.sh"
