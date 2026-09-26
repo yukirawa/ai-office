@@ -1,7 +1,7 @@
-//! ai-office TUI（Phase 0.4）。
+//! ai-office TUI（Phase 0.4 + 入力対応）。
 //!
-//! read-only ビューア。`/ws` に接続し、サーバーから届く [`ServerMsg`] を画面に表示する。
-//! 入力機能は Phase 1 以降。
+//! `/ws` に接続し、サーバーから届く [`ServerMsg`] を画面に表示する。
+//! 下部の入力行から #会議室 への発言（`say`）とタスク投入（`task`）ができる（§15）。
 //!
 //! 環境変数:
 //! - `OFFICE_SERVER_URL` 既定 `ws://127.0.0.1:8787/ws`
@@ -9,7 +9,7 @@
 //!
 //! ヘッドレススモークモード:
 //! - `OFFICE_TUI_SNAPSHOT=1` または第1引数 `--snapshot` で、代替スクリーンに入らず
-//!   約2秒収集してプレーンテキストのサマリを stdout に出し、exit 0 する。
+//!   約2秒収集してプレーンテキストのサマリを stdout に出し、exit 0 する（入力は使わない）。
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -26,8 +26,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::sync::{mpsc, watch};
+use tokio::time::{Instant, interval_at, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -45,6 +45,25 @@ const MAX_TASK_ROWS: usize = 8;
 const SNAPSHOT_SECS: u64 = 2;
 /// フレーム更新間隔（約10fps）。
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
+/// heartbeat の送信間隔（§4.1 の推奨 30 秒）。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// 発言の既定チャンネル（§15.1）。
+const DEFAULT_CHANNEL: &str = "#会議室";
+/// 入力行に出すヒント。
+const INPUT_HINT: &str = "[Enter] 送信  [/task タイトル] 依頼  [/help]  [/quit or Esc] 終了";
+/// 入力行の右端に出す接続状態の最大表示幅。
+const MAX_STATUS_WIDTH: u16 = 28;
+/// `/task` にタイトルが無いときの使い方。
+const TASK_USAGE: &str = "使い方: /task <タイトル>";
+/// `/help` の表示内容。
+const HELP_LINES: &[&str] = &[
+    "コマンド:",
+    "  /task <タイトル>  タスクを依頼",
+    "  /help             このヘルプを表示",
+    "  /quit, /exit      終了",
+    "  その他の入力      #会議室 へ発言",
+    "キー: Enter=送信 / Ctrl-U=クリア / Esc・Ctrl-C=終了 (q は入力文字)",
+];
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
@@ -74,6 +93,8 @@ struct NoticeLine {
     from: String,
     text: String,
     ts: String,
+    /// TUI ローカルの表示（送信エコー / ヘルプ / システム行）。サーバー由来ではない。
+    local: bool,
 }
 
 /// 接続状態。
@@ -118,6 +139,8 @@ struct App {
     /// 最新の office_state が持つタスク一覧（新しい順。追記ではなく置換）。
     tasks: Vec<TaskInfo>,
     notices: Vec<NoticeLine>,
+    /// 下部の入力バッファ（カーソルは常に末尾）。
+    input: String,
     status: ConnectionStatus,
 }
 
@@ -130,6 +153,7 @@ impl Default for App {
             relationships: Vec::new(),
             tasks: Vec::new(),
             notices: Vec::new(),
+            input: String::new(),
             status: ConnectionStatus::Connecting,
         }
     }
@@ -153,11 +177,9 @@ impl App {
                     from: from.clone(),
                     text: text.clone(),
                     ts: ts.clone(),
+                    local: false,
                 });
-                if self.notices.len() > MAX_NOTICES {
-                    let excess = self.notices.len() - MAX_NOTICES;
-                    self.notices.drain(0..excess);
-                }
+                self.trim_notices();
             }
             ServerMsg::OfficeState {
                 online,
@@ -178,6 +200,26 @@ impl App {
             | ServerMsg::TaskCancel { .. }
             | ServerMsg::Error { .. }
             | ServerMsg::Unknown => {}
+        }
+    }
+
+    /// TUI ローカルの行（送信エコー / ヘルプ / システム行）を追加する。
+    fn push_local(&mut self, text: String) {
+        self.notices.push(NoticeLine {
+            channel: DEFAULT_CHANNEL.to_string(),
+            from: "owner".to_string(),
+            text,
+            ts: String::new(),
+            local: true,
+        });
+        self.trim_notices();
+    }
+
+    /// notice の保持件数を [`MAX_NOTICES`] に収める。
+    fn trim_notices(&mut self) {
+        if self.notices.len() > MAX_NOTICES {
+            let excess = self.notices.len() - MAX_NOTICES;
+            self.notices.drain(0..excess);
         }
     }
 
@@ -385,21 +427,23 @@ fn run_tui(cfg: Config) -> Result<()> {
 
     let app = Arc::new(Mutex::new(App::default()));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // UI -> WebSocket の送信チャンネル。切断中は未送信のままバッファされ、再接続後に送られる。
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<ClientMsg>();
 
-    // WebSocket 受信タスク。ランタイムのワーカースレッド上で動く。
+    // WebSocket 送受信タスク。ランタイムのワーカースレッド上で動く。
     {
         let app = Arc::clone(&app);
         rt.spawn(async move {
-            ws_loop(cfg, app, shutdown_rx).await;
+            ws_loop(cfg, app, shutdown_rx, out_rx).await;
         });
     }
 
     // `ratatui::init()` は代替スクリーン + raw モード + panic 時の復元フックを設定する。
     let mut terminal = ratatui::init();
-    let result = run_ui(&mut terminal, &app);
+    let result = run_ui(&mut terminal, &app, &out_tx);
     ratatui::restore();
 
-    // 受信タスクに bye を送る余地を与えつつ、確実に片付ける。
+    // 送信タスクに bye を送る余地を与えつつ、確実に片付ける。
     let _ = shutdown_tx.send(true);
     rt.shutdown_timeout(Duration::from_millis(500));
 
@@ -407,31 +451,87 @@ fn run_tui(cfg: Config) -> Result<()> {
 }
 
 /// キー入力をポーリングしながら約10fpsで描画する。
-fn run_ui(terminal: &mut DefaultTerminal, app: &Arc<Mutex<App>>) -> Result<()> {
+fn run_ui(
+    terminal: &mut DefaultTerminal,
+    app: &Arc<Mutex<App>>,
+    out_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> Result<()> {
     loop {
         {
             let state = app.lock().expect("app mutex poisoned");
             terminal.draw(|frame| draw(frame, &state))?;
         }
 
-        if event::poll(FRAME_INTERVAL)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
+        if !event::poll(FRAME_INTERVAL)? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        let mut outgoing: Option<ClientMsg> = None;
+        let mut quit = false;
         {
+            let mut state = app.lock().expect("app mutex poisoned");
             match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(());
+                // 終了は Esc / Ctrl-C。`q` は入力文字として扱う（§15.2）。
+                KeyCode::Esc => quit = true,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => quit = true,
+                KeyCode::Enter => {
+                    let input = std::mem::take(&mut state.input);
+                    match parse_input(&input) {
+                        InputAction::Empty => {}
+                        InputAction::Quit => quit = true,
+                        InputAction::Help => {
+                            for line in HELP_LINES {
+                                state.push_local((*line).to_string());
+                            }
+                        }
+                        InputAction::TaskUsage => state.push_local(TASK_USAGE.to_string()),
+                        InputAction::Task(title) => {
+                            // サーバーのエコーを待たずに即時フィードバックを出す。
+                            state.push_local(format!("> /task {title}"));
+                            outgoing = Some(ClientMsg::Task {
+                                title,
+                                description: String::new(),
+                                mode: "local".to_string(),
+                                repo: String::new(),
+                                base_branch: String::new(),
+                            });
+                        }
+                        InputAction::Say(text) => {
+                            state.push_local(format!("> {text}"));
+                            outgoing = Some(ClientMsg::Say {
+                                channel: DEFAULT_CHANNEL.to_string(),
+                                text,
+                            });
+                        }
+                    }
                 }
-                KeyCode::Esc => return Ok(()),
-                _ => {}
+                code => apply_input_key(&mut state.input, code, key.modifiers),
             }
+        }
+
+        if quit {
+            return Ok(());
+        }
+        if let Some(msg) = outgoing {
+            // 受信側がまだ居ない（起動直後）場合は取りこぼすが、致命的ではない。
+            let _ = out_tx.send(msg);
         }
     }
 }
 
 /// WebSocket 接続を維持し、切れたら指数バックオフで再接続する。
-async fn ws_loop(cfg: Config, app: Arc<Mutex<App>>, mut shutdown: watch::Receiver<bool>) {
+async fn ws_loop(
+    cfg: Config,
+    app: Arc<Mutex<App>>,
+    mut shutdown: watch::Receiver<bool>,
+    mut out_rx: mpsc::UnboundedReceiver<ClientMsg>,
+) {
     let mut retries: u64 = 0;
     loop {
         if *shutdown.borrow() {
@@ -439,7 +539,7 @@ async fn ws_loop(cfg: Config, app: Arc<Mutex<App>>, mut shutdown: watch::Receive
         }
         set_status(&app, ConnectionStatus::Connecting);
 
-        match session(&cfg, &app, &mut shutdown).await {
+        match session(&cfg, &app, &mut shutdown, &mut out_rx).await {
             SessionEnd::Shutdown => return,
             SessionEnd::Disconnected(reason) => {
                 set_status(&app, ConnectionStatus::Disconnected(reason));
@@ -468,10 +568,16 @@ enum SessionEnd {
     Disconnected(String),
 }
 
+/// 1 セッション分の送受信を多重化する。
+///
+/// 受信（`stream.next()`）と送信（`out_rx` / heartbeat）を `select!` で同時に進めるので、
+/// 受信待ちの間でもユーザー入力や heartbeat を送れる。再接続のたびに呼ばれ、
+/// 新しく hello を送り直す（`out_rx` は呼び側が持ち越すため未送信分は失われない）。
 async fn session(
     cfg: &Config,
     app: &Arc<Mutex<App>>,
     shutdown: &mut watch::Receiver<bool>,
+    out_rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
 ) -> SessionEnd {
     let ws = match tokio_tungstenite::connect_async(cfg.url.as_str()).await {
         Ok((ws, _resp)) => ws,
@@ -488,6 +594,9 @@ async fn session(
         return SessionEnd::Disconnected(format!("hello send failed: {err}"));
     }
     set_status(app, ConnectionStatus::Connected);
+
+    // hello 直後に tick が飛ばないよう、最初の 1 回は間隔後から始める。
+    let mut heartbeat = interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
 
     loop {
         tokio::select! {
@@ -509,6 +618,27 @@ async fn session(
                     }
                     Some(Err(err)) => return SessionEnd::Disconnected(err.to_string()),
                     None => return SessionEnd::Disconnected(String::new()),
+                }
+            }
+            outgoing = out_rx.recv() => {
+                match outgoing {
+                    Some(msg) => {
+                        if let Err(err) = sink.send(Message::text(msg.to_json())).await {
+                            return SessionEnd::Disconnected(format!("send failed: {err}"));
+                        }
+                    }
+                    // UI 側の送信チャンネルが閉じた = TUI 終了。
+                    None => {
+                        let _ = send_bye(&mut sink).await;
+                        let _ = sink.close().await;
+                        return SessionEnd::Shutdown;
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                let hb = ClientMsg::Heartbeat { ts: now_iso() };
+                if let Err(err) = sink.send(Message::text(hb.to_json())).await {
+                    return SessionEnd::Disconnected(format!("heartbeat failed: {err}"));
                 }
             }
         }
@@ -570,12 +700,18 @@ fn draw_employees(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let list = List::new(items).block(Block::bordered().title("社員"));
+    let list = List::new(items).block(Block::bordered().title(Line::styled(
+        "社員",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
     frame.render_widget(list, area);
 }
 
 fn draw_tasks(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::bordered().title("タスク");
+    let block = Block::bordered().title(Line::styled(
+        "タスク",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(area);
     // 枠線の内側の表示幅（全角は幅2で数える）。
     let max_width = inner.width as usize;
@@ -608,13 +744,33 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_notices(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::bordered().title("#会議室");
+    let block = Block::bordered().title(Line::styled(
+        DEFAULT_CHANNEL,
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(area);
 
     let lines: Vec<Line> = app
         .notices
         .iter()
-        .map(|n| Line::from(format!("{}: {}", n.from, n.text)))
+        .map(|n| {
+            if n.local {
+                // 送信エコー / ヘルプ / システム行は一目で区別できるよう色を変える。
+                Line::from(Span::styled(
+                    n.text.clone(),
+                    Style::default().fg(Color::Cyan),
+                ))
+            } else {
+                // 送信者は太字、本文は通常。
+                Line::from(vec![
+                    Span::styled(
+                        format!("{}: ", n.from),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(n.text.clone()),
+                ])
+            }
+        })
         .collect();
     let total = lines.len();
     let offset = total.saturating_sub(inner.height as usize) as u16;
@@ -668,30 +824,135 @@ fn draw_mgr(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let paragraph = Paragraph::new(lines).block(Block::bordered().title("mgr"));
+    let paragraph = Paragraph::new(lines).block(Block::bordered().title(Line::styled(
+        "mgr",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
     frame.render_widget(paragraph, area);
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(48)]).split(area);
+    let status_text = app.status.label();
+    let status_width = (UnicodeWidthStr::width(status_text.as_str()) as u16)
+        .min(MAX_STATUS_WIDTH)
+        .min(area.width.saturating_sub(1));
+    // プロンプト領域を最低1桁残してからヒント幅を決める（狭い端末でも安全）。
+    let hint_width = (UnicodeWidthStr::width(INPUT_HINT) as u16)
+        .min(area.width.saturating_sub(status_width).saturating_sub(1));
 
-    let prompt = Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("_", Style::default().fg(Color::DarkGray)),
-    ]));
-    frame.render_widget(prompt, cols[0]);
+    let cols = Layout::horizontal([
+        Constraint::Min(1),
+        Constraint::Length(hint_width),
+        Constraint::Length(status_width),
+    ])
+    .split(area);
 
-    let status = Paragraph::new(Line::from(Span::styled(
-        app.status.label(),
-        Style::default().fg(app.status.color()),
-    )))
-    .alignment(ratatui::layout::Alignment::Right);
-    frame.render_widget(status, cols[1]);
+    // 入力行（カーソルは常に末尾なので、空でなければカーソル記号を添える）。
+    let mut spans = vec![Span::styled(
+        "> ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if app.input.is_empty() {
+        spans.push(Span::styled("_", Style::default().fg(Color::DarkGray)));
+    } else {
+        spans.push(Span::raw(app.input.clone()));
+        spans.push(Span::styled("‸", Style::default().fg(Color::Gray)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
+
+    // ヒント（控えめな色）。
+    let hint = truncate_to_width(INPUT_HINT, hint_width as usize);
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+        cols[1],
+    );
+
+    // 接続状態（色付き）。
+    let status = truncate_to_width(&status_text, status_width as usize);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            status,
+            Style::default().fg(app.status.color()),
+        ))
+        .alignment(ratatui::layout::Alignment::Right),
+        cols[2],
+    );
 }
 
 // ---------------------------------------------------------------------------
 // ヘルパ
 // ---------------------------------------------------------------------------
+
+/// Enter で確定した入力の解釈結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputAction {
+    /// 空入力。何もしない。
+    Empty,
+    /// 終了。
+    Quit,
+    /// ヘルプ表示。
+    Help,
+    /// タスク投入（タイトル）。
+    Task(String),
+    /// タイトル無しの `/task`。
+    TaskUsage,
+    /// #会議室 への発言。
+    Say(String),
+}
+
+/// 入力行の文字列を解釈する（§15.2）。
+///
+/// - `/task <タイトル>` → [`InputAction::Task`]（タイトル必須）
+/// - `/help` / `/quit` / `/exit`
+/// - それ以外の非空入力 → [`InputAction::Say`]
+/// - 空白のみ → [`InputAction::Empty`]
+fn parse_input(input: &str) -> InputAction {
+    let input = input.trim();
+    if input.is_empty() {
+        return InputAction::Empty;
+    }
+    match input {
+        "/quit" | "/exit" => return InputAction::Quit,
+        "/help" => return InputAction::Help,
+        "/task" => return InputAction::TaskUsage,
+        _ => {}
+    }
+    if let Some(rest) = input.strip_prefix("/task") {
+        let mut chars = rest.chars();
+        match chars.next() {
+            // `/task` 単体は上で処理済みだが、念のため。
+            None => return InputAction::TaskUsage,
+            // `/task <タイトル>`（空白区切り）だけをコマンドとして扱う。
+            Some(c) if c.is_whitespace() => {
+                let title = chars.as_str().trim();
+                if title.is_empty() {
+                    return InputAction::TaskUsage;
+                }
+                return InputAction::Task(title.to_string());
+            }
+            // `/taskfoo` のような未知の語は発言として扱う。
+            Some(_) => {}
+        }
+    }
+    InputAction::Say(input.to_string())
+}
+
+/// 入力バッファに 1 キー分の編集を適用する（Enter や終了系は呼び側で処理する）。
+fn apply_input_key(input: &mut String, code: KeyCode, modifiers: KeyModifiers) {
+    match code {
+        KeyCode::Backspace => {
+            input.pop();
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => input.push(c),
+        _ => {}
+    }
+}
+
+/// 現在時刻を RFC 3339（秒精度, UTC, `Z`）で返す（heartbeat 用）。
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
 
 /// status から（アイコン, 日本語ラベル, 色）を返す。
 fn status_display(status: &str) -> (&'static str, String, Color) {
@@ -710,9 +971,10 @@ fn task_status_prefix(status: &str) -> (&'static str, Color) {
     match status {
         "done" => ("✔", Color::Green),
         "working" => ("▶", Color::Yellow),
-        "review" => ("◀", Color::Cyan),
-        "assigned" => ("○", Color::Blue),
-        "pending" => ("·", Color::DarkGray),
+        "review" => ("◀", Color::Yellow),
+        // pending / assigned は既定色（強調しない）。
+        "assigned" => ("○", Color::Reset),
+        "pending" => ("·", Color::Reset),
         "failed" => ("✗", Color::Red),
         _ => ("·", Color::DarkGray),
     }
@@ -767,9 +1029,10 @@ fn env_string(key: &str, default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ConnectionStatus, backoff_delay, status_display, task_status_prefix,
-        task_summary_lines, truncate_to_width,
+        App, ConnectionStatus, InputAction, apply_input_key, backoff_delay, parse_input,
+        status_display, task_status_prefix, task_summary_lines, truncate_to_width,
     };
+    use crossterm::event::{KeyCode, KeyModifiers};
     use protocol::{EmployeeInfo, ServerMsg, TaskInfo};
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -806,6 +1069,67 @@ mod tests {
         assert_eq!(backoff_delay(5), Duration::from_secs(16));
         assert_eq!(backoff_delay(6), Duration::from_secs(30));
         assert_eq!(backoff_delay(99), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_input_commands_and_say() {
+        assert_eq!(parse_input(""), InputAction::Empty);
+        assert_eq!(parse_input("    "), InputAction::Empty);
+        assert_eq!(parse_input("/task x"), InputAction::Task("x".to_string()));
+        assert_eq!(
+            parse_input("/task   レポート作成"),
+            InputAction::Task("レポート作成".to_string())
+        );
+        assert_eq!(parse_input("/task"), InputAction::TaskUsage);
+        assert_eq!(parse_input("/task   "), InputAction::TaskUsage);
+        assert_eq!(parse_input("/help"), InputAction::Help);
+        assert_eq!(parse_input("/quit"), InputAction::Quit);
+        assert_eq!(parse_input("/exit"), InputAction::Quit);
+        // コマンド以外の非空入力は発言。前後の空白は落とす。
+        assert_eq!(
+            parse_input("おはよう"),
+            InputAction::Say("おはよう".to_string())
+        );
+        assert_eq!(
+            parse_input("  hello world  "),
+            InputAction::Say("hello world".to_string())
+        );
+        // `/taskfoo` はコマンドではなく発言として扱う。
+        assert_eq!(
+            parse_input("/taskfoo"),
+            InputAction::Say("/taskfoo".to_string())
+        );
+    }
+
+    #[test]
+    fn input_editing_insert_backspace_clear() {
+        let mut buf = String::new();
+        apply_input_key(&mut buf, KeyCode::Char('a'), KeyModifiers::NONE);
+        apply_input_key(&mut buf, KeyCode::Char('b'), KeyModifiers::NONE);
+        apply_input_key(&mut buf, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(buf, "abc");
+
+        apply_input_key(&mut buf, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(buf, "ab");
+        // 空で Backspace しても panic しない。
+        for _ in 0..5 {
+            apply_input_key(&mut buf, KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        assert_eq!(buf, "");
+
+        // Ctrl-U でクリア。
+        apply_input_key(&mut buf, KeyCode::Char('x'), KeyModifiers::NONE);
+        apply_input_key(&mut buf, KeyCode::Char('y'), KeyModifiers::NONE);
+        apply_input_key(&mut buf, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(buf, "");
+
+        // 制御文字は挿入しない。
+        apply_input_key(&mut buf, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(buf, "");
+
+        // `q` は入力文字（終了ではない）。
+        apply_input_key(&mut buf, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(buf, "q");
     }
 
     #[test]
@@ -988,6 +1312,7 @@ mod tests {
             ts: "t".to_string(),
         });
         app.status = ConnectionStatus::Connected;
+        app.input = "/task レポート".to_string();
 
         let view = render_to_string(&app, 100, 30);
         // 全角文字は TestBackend 上で幅2のセル + 埋め草になるため、空白を除いて照合する。
@@ -1004,6 +1329,20 @@ mod tests {
         assert!(compact.contains("mgr:今日のタスクは…"), "{view}");
         assert!(compact.contains('●'), "{view}");
         assert!(compact.contains('○'), "{view}");
+        // 下部の入力行とヒント。
+        assert!(compact.contains(">/taskレポート"), "{view}");
+        assert!(compact.contains("[Enter]送信"), "{view}");
+        assert!(compact.contains("[/quitorEsc]終了"), "{view}");
+    }
+
+    #[test]
+    fn draw_input_line_shows_placeholder_and_hint() {
+        // 入力が空のときは `_` プレースホルダを出す。
+        let app = App::default();
+        let view = render_to_string(&app, 100, 30);
+        let compact: String = view.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains(">_"), "{view}");
+        assert!(compact.contains("[Enter]送信"), "{view}");
     }
 
     #[test]
@@ -1014,5 +1353,13 @@ mod tests {
         let compact: String = view.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(compact.contains("タスク"), "{view}");
         assert!(compact.contains("(なし)"), "{view}");
+    }
+
+    #[test]
+    fn draw_does_not_panic_on_tiny_terminal() {
+        // 極端に狭い端末でも saturating_sub で安全に描画できる。
+        for (w, h) in [(1u16, 1u16), (5, 3), (10, 4), (20, 5)] {
+            let _ = render_to_string(&App::default(), w, h);
+        }
     }
 }

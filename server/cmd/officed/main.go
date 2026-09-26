@@ -420,6 +420,10 @@ func startPayrollCron(
 	}
 
 	c := cron.New(cron.WithLocation(loc))
+	if !cfg.PayrollCronEnabled() {
+		logger.Info("日割り給与 cron は無効です", "cron", cfg.PayrollCron)
+		return c
+	}
 	_, err = c.AddFunc(cfg.PayrollCron, func() {
 		runPayroll(ctx, st, econ, srv, loc, logger)
 	})

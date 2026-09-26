@@ -131,3 +131,21 @@ type taskProgressMsg struct {
 	Message string `json:"message"`
 	Percent int    `json:"percent"`
 }
+
+// sayMsg は TUI オーナーからの発言（§15.1）。
+// channel 省略時はサーバーが #会議室 に寄せる。
+type sayMsg struct {
+	Type    string `json:"type"`
+	Channel string `json:"channel"`
+	Text    string `json:"text"`
+}
+
+// taskMsg は TUI オーナーからのタスク投入（§15.1）。title は必須。
+type taskMsg struct {
+	Type        string `json:"type"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Mode        string `json:"mode"`
+	Repo        string `json:"repo"`
+	BaseBranch  string `json:"base_branch"`
+}

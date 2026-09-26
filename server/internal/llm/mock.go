@@ -46,9 +46,12 @@ func (m *MockClient) Chat(ctx context.Context, req Request) (Response, error) {
 	m.mu.Unlock()
 
 	return Response{
-		Text:       text,
-		Model:      mockModel,
-		StopReason: "end_turn",
+		Text:  text,
+		Model: mockModel,
+		// プロバイダ非依存のモックなので、OpenAI/DeepSeek の終端理由（"stop"）を返す。
+		// （Anthropic の "end_turn" でも終端だが、stop を既定にすることで
+		//   終端判定のプロバイダ差異をテストで踏みやすくする）
+		StopReason: "stop",
 	}, nil
 }
 

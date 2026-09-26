@@ -208,7 +208,17 @@ func (c *Config) GitHubEnabled() bool {
 
 // ChatCronEnabled は雑談 cron が有効かを返す。空文字・"off"/"none"/"disabled" は無効。
 func (c *Config) ChatCronEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(c.ChatCron)) {
+	return cronEnabled(c.ChatCron)
+}
+
+// PayrollCronEnabled は日割り給与 cron が有効かを返す。空文字・"off"/"none"/"disabled" は無効。
+func (c *Config) PayrollCronEnabled() bool {
+	return cronEnabled(c.PayrollCron)
+}
+
+// cronEnabled は cron 式が有効（登録すべき）かを判定する。
+func cronEnabled(expr string) bool {
+	switch strings.ToLower(strings.TrimSpace(expr)) {
 	case "", "off", "none", "disabled":
 		return false
 	default:

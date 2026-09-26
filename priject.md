@@ -541,3 +541,36 @@ tasks に 3 列を追加（§5 の「カラム追加はOK」）: `mode`（既定
   キーは env / `.env` / `secrets/<provider>.key` のいずれでも可。
 - 起動: `start-server` / `start-client`（リポジトリ直下と `~/.local/bin`）。実体は `scripts/server.sh` /
   `scripts/client.sh`。
+- 終端判定のプロバイダ差異修正: 以前は Anthropic の停止理由（`end_turn` 等）しか終端と
+  見なしておらず、OpenAI 互換（DeepSeek の `stop`）を「継続」と誤判定して max_turns まで
+  回り続けていた。`isTerminalStop` を `stop`/`end`/`end_turn`/不明=終端、
+  `length`/`max_tokens`/`tool_use`/`tool_calls`=継続に修正（Phase 5 の前に修正）。
+- `OFFICE_PAYROLL_CRON` / `OFFICE_CHAT_CRON` は `off`（`none`/`disabled` 含む）で無効化できる。
+
+---
+
+## 15. TUI からの入力（§4.2 追補）
+
+Phase 0 の TUI は read-only だったため、クライアント画面から発言・指示ができなかった。
+オーナーが TUI から操作できるようにする（§4.2 の「新しい type の追加は自由」）。
+
+### 15.1 Client → Server（追加）
+
+- `say` — #会議室 への発言。
+  ```json
+  {"type":"say","channel":"#会議室","text":"おはよう"}
+  ```
+  `channel` 省略時は `#会議室`。サーバーは `from` = 接続 ID（TUI は `owner`）で `notice` を配信し、
+  chat 役がいればその発言を chat に渡して応答させる。
+- `task` — タスク投入（`POST /api/tasks` と同じ経路）。
+  ```json
+  {"type":"task","title":"...","description":"...","mode":"local","repo":"","base_branch":""}
+  ```
+  `title` は必須。サーバーは `CreateTask` して mgr に渡す。
+
+### 15.2 TUI の操作
+
+- 下部に入力行。`Enter` で送信。
+- `/(スラッシュ)コマンド: `/task <タイトル>` でタスク投入、`/help` でヘルプ、`/quit` で終了。
+- 上記以外は `say`（#会議室 への発言）。chat 役が応答する。
+- 終了は `Esc` または `Ctrl-C`（`q` は入力文字として扱う）。

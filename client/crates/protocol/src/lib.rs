@@ -37,6 +37,22 @@ pub enum ClientMsg {
         message: String,
         percent: u8,
     },
+    /// #会議室 への発言（§15.1）。`channel` は通常 `#会議室`。
+    Say { channel: String, text: String },
+    /// タスク投入（§15.1、サーバー側の `POST /api/tasks` と同じ経路）。
+    ///
+    /// `title` 以外は省略可能（省略時は既定値。`mode` は呼び側で `local` を推奨）。
+    Task {
+        title: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        mode: String,
+        #[serde(default)]
+        repo: String,
+        #[serde(default)]
+        base_branch: String,
+    },
 }
 
 impl ClientMsg {
@@ -512,6 +528,53 @@ mod tests {
             r#"{"type":"task_progress","task_id":"t1","message":"working","percent":50}"#
         );
         assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn say_json_is_exact() {
+        let msg = ClientMsg::Say {
+            channel: "#会議室".to_string(),
+            text: "おはよう".to_string(),
+        };
+        let json = msg.to_json();
+        assert_eq!(
+            json,
+            r##"{"type":"say","channel":"#会議室","text":"おはよう"}"##
+        );
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn task_json_is_exact() {
+        let msg = ClientMsg::Task {
+            title: "レポート作成".to_string(),
+            description: String::new(),
+            mode: "local".to_string(),
+            repo: String::new(),
+            base_branch: String::new(),
+        };
+        let json = msg.to_json();
+        assert_eq!(
+            json,
+            r#"{"type":"task","title":"レポート作成","description":"","mode":"local","repo":"","base_branch":""}"#
+        );
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn task_optional_fields_can_be_omitted() {
+        // title 以外は省略でき、既定値（空文字）になる。
+        let parsed: ClientMsg = serde_json::from_str(r#"{"type":"task","title":"A"}"#).unwrap();
+        assert_eq!(
+            parsed,
+            ClientMsg::Task {
+                title: "A".to_string(),
+                description: String::new(),
+                mode: String::new(),
+                repo: String::new(),
+                base_branch: String::new(),
+            }
+        );
     }
 
     #[test]

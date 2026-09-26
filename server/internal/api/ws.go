@@ -295,7 +295,7 @@ func (s *Server) checkOut(ctx context.Context, id, name, reason string) {
 	s.BroadcastState()
 }
 
-// readLoop は heartbeat / bye を処理する。接続が切れるか bye を受けると理由を返す。
+// readLoop は受信メッセージを種別ごとに処理する。接続が切れるか bye を受けると理由を返す。
 func (s *Server) readLoop(ctx context.Context, cl *client) string {
 	for {
 		typ, data, err := cl.conn.Read(ctx)
@@ -344,6 +344,57 @@ func (s *Server) readLoop(ctx context.Context, cl *client) string {
 			}
 			s.log.Info("task_progress を受信しました",
 				"task_id", pg.TaskID, "percent", pg.Percent, "message", pg.Message)
+		case "say":
+			var sm sayMsg
+			if err := json.Unmarshal(data, &sm); err != nil {
+				s.log.Warn("say の解釈に失敗しました", "employee_id", cl.employeeID, "error", err)
+				continue
+			}
+			text := strings.TrimSpace(sm.Text)
+			if text == "" {
+				s.sendError(cl, "invalid_say", "text が空です")
+				continue
+			}
+			channel := strings.TrimSpace(sm.Channel)
+			if channel == "" {
+				channel = channelDefault
+			}
+			// 永続化 + notice 配信。失敗しても接続は維持する。
+			if err := s.Notify(ctx, channel, cl.employeeID, text); err != nil {
+				s.log.Warn("say の投稿に失敗しました", "employee_id", cl.employeeID, "error", err)
+			}
+			// chat 役がいればその発言を渡して応答させる（§15.1）。
+			if chat := s.chatAgent(); chat != nil {
+				if !chat.Post(text) {
+					s.log.Warn("chat 役の受信箱が満杯のため発言を渡せませんでした", "employee_id", cl.employeeID)
+				}
+			}
+			s.log.Info("say を受信しました",
+				"employee_id", cl.employeeID, "channel", channel, "text", truncateRunes(text, 80))
+		case "task":
+			var tm taskMsg
+			if err := json.Unmarshal(data, &tm); err != nil {
+				s.log.Warn("task の解釈に失敗しました", "employee_id", cl.employeeID, "error", err)
+				continue
+			}
+			title := strings.TrimSpace(tm.Title)
+			if title == "" {
+				s.sendError(cl, "invalid_task", "title は必須です")
+				continue
+			}
+			id, err := s.CreateTask(ctx, CreateTaskInput{
+				Title:       title,
+				Description: tm.Description,
+				From:        cl.employeeID,
+				Mode:        tm.Mode,
+				Repo:        tm.Repo,
+				BaseBranch:  tm.BaseBranch,
+			})
+			if err != nil {
+				s.sendError(cl, "task_failed", err.Error())
+				continue
+			}
+			s.log.Info("task を受け付けました", "task_id", id, "employee_id", cl.employeeID)
 		case "hello":
 			s.sendError(cl, "duplicate_hello", "hello は接続時に 1 回だけ送ってください")
 		default:
@@ -399,6 +450,15 @@ func (s *Server) sendHistory(cl *client) {
 			TS:      formatTS(m.TS),
 		})
 	}
+}
+
+// truncateRunes はログ用に s を最大 n ルーンへ切り詰める。
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // nonNil は nil スライスを空スライスに正規化する（JSON で null にしない）。

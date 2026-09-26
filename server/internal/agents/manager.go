@@ -67,8 +67,9 @@ const (
 // planningInstruction は mgr の計画フェーズ用の追加システムプロンプト。
 const planningInstruction = "あなたは管理職です。タスクの実行計画を短く日本語で述べてください。実行はしないこと。"
 
-// continueInstruction は応答が終端でなかった場合に次のターンへ促す文言。
-const continueInstruction = "前回の計画を踏まえて更新してください。変化がなければ同じ内容を返して構いません。"
+// continueInstruction は応答が終端でなかった場合に次のターンへ促す汎用文言。
+// mgr / dev で共有するため、計画に依存しない言い回しにする。
+const continueInstruction = "続きがあれば簡潔に続けてください。続きが無ければ同じ内容を返して構いません。"
 
 // Notifier は agent からチャンネル投稿・状態公開を行うための境界。
 // api パッケージを import すると循環参照になるため、インターフェースで分離する。
@@ -548,14 +549,19 @@ func reportPrefix(t Task) string {
 }
 
 // isTerminalStop は応答が「これ以上続ける必要がない」ことを示すか判定する。
-// Anthropic の end_turn / stop_sequence、および stop_reason 未設定は終端扱い。
+//
+// Anthropic は "end_turn" / "stop_sequence"、OpenAI 互換（DeepSeek 等）は "stop" を返す。
+// 両方に対応させる（以前は Anthropic の理由しか終端扱いにしておらず、DeepSeek の "stop" を
+// 「継続」と誤判定して max_turns まで回り続ける不具合があった）。
+//
+// 判定に迷う理由は、無限ループを避けるため終端扱いにする。
 func isTerminalStop(reason string) bool {
 	switch strings.TrimSpace(reason) {
-	case "", "end_turn", "stop_sequence":
-		return true
-	default:
-		// max_tokens / tool_use / pause_turn などは継続余地ありとして扱う。
+	case "length", "max_tokens", "tool_use", "tool_calls", "pause_turn":
+		// 続きの生成やツール実行が必要な応答。
 		return false
+	default:
+		return true
 	}
 }
 

@@ -18,6 +18,8 @@ secrets/
 # DB・ログ
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 *.log
 server/data/
 client/data/

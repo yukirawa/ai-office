@@ -86,7 +86,23 @@ sh scripts/demo.sh
 ```
 
 `officed` と worker 2 体を起動して TUI を表示する。終了すると全部止まる。
-TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: `mgr`）と下部の `> _`。
+TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: `mgr`）と下部の入力行を表示する。
+
+### TUI の操作
+
+| キー / 入力 | 動作 |
+| --- | --- |
+| `Enter` | 送信 |
+| 文字入力 | 入力行に追加（`q` も文字として入力される） |
+| `Backspace` / `Ctrl-U` | 1 文字削除 / 全消去 |
+| `Esc` / `Ctrl-C` | 終了 |
+| 通常のテキスト | `#会議室` へ発言（`say`）。chat 役が返信する |
+| `/task <タイトル>` | タスクを投入（`POST /api/tasks` と同じ経路。mgr が計画→dev が実行） |
+| `/help` | コマンド一覧を表示 |
+| `/quit` | 終了 |
+
+例: `おはよう` → 会議室に投稿され chat が応答。`/task ログイン画面を作る` → mgr が計画し
+dev_m / dev_f に割当て、worker が実行する。
 
 ## 手動で起動する
 
@@ -294,6 +310,15 @@ curl -X POST http://127.0.0.1:8787/api/chat -H 'Content-Type: application/json' 
 - `#会議室`: mgr の計画 → dev_* の実行結果 → mgr のレビュー、chat 役の雑談
 - 生成物: `server/data/ws/<employee>/reports/<task_id>.md`
 - TUI 右ペインの mgr 関係値が成功で上がる（`dev_m +n`）
+
+### ログ解析
+
+```sh
+sh scripts/logcheck.sh          # 既定: server/data/smoke を解析
+sh scripts/logcheck.sh <dir>    # server.log / dev_*.log のあるディレクトリを解析
+```
+
+check-in/out、タスク遷移、say、cron、ERROR/WARN、panic を集計し PASS / WARN / FAIL を判定します。
 
 ### 5. TUI の表示項目
 
