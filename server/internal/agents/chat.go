@@ -14,9 +14,6 @@ import (
 // chatMaxReplyRunes は 1 応答としてチャンネルへ流す最大文字数（rune）。
 const chatMaxReplyRunes = 500
 
-// chatInstruction は雑談役に与える追加システムプロンプト（§8 4.3）。
-const chatInstruction = "あなたは雑談・雑用担当です。日本語で 1〜2 文の短い返事だけをしてください。説明や箇条書きは不要です。"
-
 // chatContinueInstruction は応答が終端でなかった場合に次のターンへ促す文言。
 const chatContinueInstruction = "もっと短く、1〜2 文でまとめてください。"
 
@@ -34,6 +31,9 @@ type ChatAgent struct {
 
 	mu    sync.RWMutex
 	state string
+
+	// models は実行時に差し替え可能なモデル名を保持する（Phase 5 の高級モデル購入）。
+	models modelState
 }
 
 // NewChatAgent は ChatAgent を生成する。Run を別 goroutine で呼ぶまで入力は処理されない。
@@ -52,11 +52,19 @@ func NewChatAgent(id string, p persona.Persona, client llm.Client, notifier Noti
 		opts:     opts,
 		inbox:    make(chan string, inboxCapacity),
 		state:    StateIdle,
+		models:   newModelState(opts.Model),
 	}
 }
 
 // ID は社員 ID を返す。
 func (c *ChatAgent) ID() string { return c.id }
+
+// SetModel は実行時に使うモデルを差し替える（Modeler、Phase 5）。
+// 空文字は設定既定（Options.Model、無ければ DefaultModel）へ戻す。
+func (c *ChatAgent) SetModel(model string) { c.models.set(model) }
+
+// Model は現在使うモデル名を返す（スレッドセーフ）。
+func (c *ChatAgent) Model() string { return c.models.get() }
 
 // State は現在の状態を返す（スレッドセーフ）。
 func (c *ChatAgent) State() string {
@@ -106,9 +114,25 @@ func (c *ChatAgent) Run(ctx context.Context) {
 	}
 }
 
-// handlePrompt は 1 件の入力に LLM で応答してチャンネルへ投稿する。
-// 無限ループ防止（最大ターン数・トークン予算）を mgr / dev と同様に適用する（§6.3）。
+// handlePrompt は 1 件の入力に LLM で応答してチャンネルへ投稿する（Run からの呼び出し）。
 func (c *ChatAgent) handlePrompt(ctx context.Context, prompt string) {
+	c.respond(ctx, c.opts.Channel, prompt)
+}
+
+// Converse は #会議室 などでの 1 往復の会話に応答する（Converser）。
+// メッセージ受信箱とは独立に、その場で LLM を呼んで指定チャンネルへ投稿する。
+func (c *ChatAgent) Converse(ctx context.Context, channel, prompt string) {
+	if strings.TrimSpace(channel) == "" {
+		channel = c.opts.Channel
+	}
+	ctx, cancel := context.WithTimeout(ctx, converseTimeout(c.opts))
+	defer cancel()
+	c.respond(ctx, channel, prompt)
+}
+
+// respond はチャンネルへ 1 往復の会話応答を返す。handlePrompt と Converse が共有する。
+// 無限ループ防止（最大ターン数・トークン予算）と終端判定は converseRun に集約している（§6.3）。
+func (c *ChatAgent) respond(ctx context.Context, channel, prompt string) {
 	c.setState(StateThinking)
 
 	if c.client == nil {
@@ -117,90 +141,23 @@ func (c *ChatAgent) handlePrompt(ctx context.Context, prompt string) {
 		return
 	}
 
-	req := llm.Request{
-		Model:     c.opts.Model,
-		System:    c.systemPrompt(),
-		Messages:  []llm.Message{{Role: "user", Content: chatPrompt(prompt)}},
-		MaxTokens: c.opts.MaxTokens,
+	text, ok := converseRun(ctx, c.client, c.logger(), c.id, c.Model(), c.systemPrompt(), prompt, c.opts)
+	if !ok {
+		c.setState(StateIdle)
+		return
 	}
 
-	maxTurns := c.opts.MaxTurns
-	budget := c.opts.TokenBudget
-
-	tokensUsed := 0
-	var lastText string
-	guard := ""
-	turns := 0
-
-	for turn := 1; turn <= maxTurns; turn++ {
-		turns = turn
-
-		// ctx が終わったら即座に抜ける（Run の終了処理を妨げない）。
-		if err := ctx.Err(); err != nil {
-			c.logger().Info("コンテキスト終了のため応答を中断します", "id", c.id, "error", err)
-			c.setState(StateIdle)
-			return
-		}
-
-		resp, err := c.client.Chat(ctx, req)
-		if err != nil {
-			// エラーは記録して次の入力を待つ（Run は落とさない）。
-			c.logger().Error("LLM 呼び出しに失敗しました", "id", c.id, "turn", turn, "error", err)
-			c.setState(StateIdle)
-			return
-		}
-
-		tokensUsed += resp.InputTokens + resp.OutputTokens
-		lastText = resp.Text
-
-		// ガード1: トークン予算超過。
-		if tokensUsed > budget {
-			guard = "token_budget"
-			break
-		}
-		// 終端理由なら 1 ターンで完了（雑談は通常ここで終わる）。
-		if isTerminalStop(resp.StopReason) {
-			break
-		}
-		// ガード2: 最大ターン数。
-		if turn == maxTurns {
-			guard = "max_turns"
-			break
-		}
-
-		// まだ続きが必要な応答（max_tokens 等）は会話を積んで次ターンへ。
-		req.Messages = append(req.Messages,
-			llm.Message{Role: "assistant", Content: lastText},
-			llm.Message{Role: "user", Content: chatContinueInstruction},
-		)
-	}
-
-	if guard != "" {
-		c.logger().Warn("雑談の無限ループ防止ガードが作動しました",
-			"id", c.id,
-			"guard", guard,
-			"turns", turns,
-			"tokens_used", tokensUsed,
-			"max_turns", maxTurns,
-			"token_budget", budget,
-		)
-	}
-
-	reply := sanitizeChatReply(lastText)
+	reply := sanitizeChatReply(text)
 	if reply == "" {
-		reply = "(うまく言葉が出てきませんでした…)"
+		reply = converseFallbackReply
 	}
-	c.notify(ctx, reply)
+	c.notifyChannel(ctx, channel, reply)
 	c.setState(StateIdle)
 }
 
-// systemPrompt はペルソナのシステムプロンプトに雑談用の指示を足して返す。
+// systemPrompt はペルソナのシステムプロンプトに会話用の指示を足して返す。
 func (c *ChatAgent) systemPrompt() string {
-	base := strings.TrimSpace(c.persona.SystemPrompt())
-	if base == "" {
-		return chatInstruction
-	}
-	return base + "\n\n" + chatInstruction
+	return buildConverseSystemPrompt(c.persona.SystemPrompt(), c.name)
 }
 
 // setState は内部状態を更新し、Notifier に公開する。
@@ -214,13 +171,18 @@ func (c *ChatAgent) setState(s string) {
 	}
 }
 
-// notify はチャンネルへ投稿する。エラーはログに記録して握りつぶす。
+// notify は既定チャンネル（Options.Channel）へ投稿する。
 func (c *ChatAgent) notify(ctx context.Context, text string) {
+	c.notifyChannel(ctx, c.opts.Channel, text)
+}
+
+// notifyChannel は指定チャンネルへ投稿する。エラーはログに記録して握りつぶす。
+func (c *ChatAgent) notifyChannel(ctx context.Context, channel, text string) {
 	if c.notifier == nil {
 		return
 	}
-	if err := c.notifier.Notify(ctx, c.opts.Channel, c.id, text); err != nil {
-		c.logger().Error("通知の投稿に失敗しました", "channel", c.opts.Channel, "error", err)
+	if err := c.notifier.Notify(ctx, channel, c.id, text); err != nil {
+		c.logger().Error("通知の投稿に失敗しました", "channel", channel, "error", err)
 	}
 }
 

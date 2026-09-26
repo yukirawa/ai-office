@@ -23,7 +23,7 @@ use protocol::{ClientMsg, EmployeeInfo, RelationshipInfo, ServerMsg, TaskInfo};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -50,9 +50,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// 発言の既定チャンネル（§15.1）。
 const DEFAULT_CHANNEL: &str = "#会議室";
 /// 入力行に出すヒント。
-const INPUT_HINT: &str = "[Enter] 送信  [/task タイトル] 依頼  [/help]  [/quit or Esc] 終了";
+const INPUT_HINT: &str = "[Enter] 送信  [PgUp/PgDn] スクロール  [@mgr/@all 宛先]  [/task タイトル]  [/help]  [/quit or Esc] 終了";
 /// 入力行の右端に出す接続状態の最大表示幅。
 const MAX_STATUS_WIDTH: u16 = 28;
+/// 入力行のヒントに使う最大幅（入力を圧迫しないように上限制）。
+const HINT_MAX_WIDTH: u16 = 60;
+/// 入力欄に最低限残す幅（プロンプト込み）。
+const INPUT_MIN_WIDTH: u16 = 16;
 /// `/task` にタイトルが無いときの使い方。
 const TASK_USAGE: &str = "使い方: /task <タイトル>";
 /// `/help` の表示内容。
@@ -61,9 +65,25 @@ const HELP_LINES: &[&str] = &[
     "  /task <タイトル>  タスクを依頼",
     "  /help             このヘルプを表示",
     "  /quit, /exit      終了",
+    "  @mgr <本文>       mgr 宛てに発言 (例: @mgr 点呼)",
+    "  @all <本文>       全員宛てに発言",
     "  その他の入力      #会議室 へ発言",
-    "キー: Enter=送信 / Ctrl-U=クリア / Esc・Ctrl-C=終了 (q は入力文字)",
+    "キー: Enter=送信 / PageUp・PageDown=スクロール / Home=最古 / End=最新",
+    "      Ctrl-U=クリア / Esc・Ctrl-C=終了 (q は入力文字)",
 ];
+
+/// 3 ペイン（社員・会議室・mgr）を出す最小幅。これ未満では右ペインを隠す。
+const THREE_PANE_MIN_WIDTH: u16 = 56;
+/// 左列（社員/タスク）を出す最小幅。これ未満では会議室だけを全幅で見せる。
+const TWO_PANE_MIN_WIDTH: u16 = 28;
+/// 左列の最小幅。
+const LEFT_MIN_WIDTH: u16 = 12;
+/// 中央（#会議室）の最小幅。
+const CENTER_MIN_WIDTH: u16 = 16;
+/// 右（mgr）の最小幅。
+const RIGHT_MIN_WIDTH: u16 = 16;
+/// 入力行と枠線を除いた、会議室ペインの概算高さ（ページ送り量の計算用）。
+const CHROME_ROWS: u16 = 3;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
@@ -139,6 +159,8 @@ struct App {
     /// 最新の office_state が持つタスク一覧（新しい順。追記ではなく置換）。
     tasks: Vec<TaskInfo>,
     notices: Vec<NoticeLine>,
+    /// 会議室のスクロール位置。下（最新）からのメッセージ数で、0 は最新を追従。
+    scroll: usize,
     /// 下部の入力バッファ（カーソルは常に末尾）。
     input: String,
     status: ConnectionStatus,
@@ -153,6 +175,7 @@ impl Default for App {
             relationships: Vec::new(),
             tasks: Vec::new(),
             notices: Vec::new(),
+            scroll: 0,
             input: String::new(),
             status: ConnectionStatus::Connecting,
         }
@@ -220,7 +243,34 @@ impl App {
         if self.notices.len() > MAX_NOTICES {
             let excess = self.notices.len() - MAX_NOTICES;
             self.notices.drain(0..excess);
+            // 先頭を捨てたぶん、行き過ぎたスクロール位置を戻す。
+            self.scroll = self.scroll.min(self.max_scroll());
         }
+    }
+
+    /// 会議室スクロールの上限（最古まで）。0 件なら 0。
+    fn max_scroll(&self) -> usize {
+        self.notices.len().saturating_sub(1)
+    }
+
+    /// 上（過去）へ `n` 件スクロールする。上限でクランプする。
+    fn scroll_up(&mut self, n: usize) {
+        self.scroll = self.scroll.saturating_add(n).min(self.max_scroll());
+    }
+
+    /// 下（最新）へ `n` 件スクロールする。0 でクランプする。
+    fn scroll_down(&mut self, n: usize) {
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    /// 最古の位置までスクロールする。
+    fn scroll_to_oldest(&mut self) {
+        self.scroll = self.max_scroll();
+    }
+
+    /// 最新に戻って追従する。
+    fn scroll_to_newest(&mut self) {
+        self.scroll = 0;
     }
 
     /// 左ペインに出す社員一覧。`employees` が空なら `online` から合成する。
@@ -457,9 +507,13 @@ fn run_ui(
     out_tx: &mpsc::UnboundedSender<ClientMsg>,
 ) -> Result<()> {
     loop {
+        let mut viewport = Rect::default();
         {
             let state = app.lock().expect("app mutex poisoned");
-            terminal.draw(|frame| draw(frame, &state))?;
+            terminal.draw(|frame| {
+                viewport = frame.area();
+                draw(frame, &state);
+            })?;
         }
 
         if !event::poll(FRAME_INTERVAL)? {
@@ -472,6 +526,8 @@ fn run_ui(
             continue;
         }
 
+        // ページ送りは枠線と入力行を除いた高さで見積もる（最低 1 件）。
+        let page = (viewport.height.saturating_sub(CHROME_ROWS) as usize).max(1);
         let mut outgoing: Option<ClientMsg> = None;
         let mut quit = false;
         {
@@ -511,6 +567,11 @@ fn run_ui(
                         }
                     }
                 }
+                // 会議室のスクロール。入力バッファには影響しない。
+                KeyCode::PageUp => state.scroll_up(page),
+                KeyCode::PageDown => state.scroll_down(page),
+                KeyCode::Home => state.scroll_to_oldest(),
+                KeyCode::End => state.scroll_to_newest(),
                 code => apply_input_key(&mut state.input, code, key.modifiers),
             }
         }
@@ -663,22 +724,39 @@ fn set_status(app: &Arc<Mutex<App>>, status: ConnectionStatus) {
 
 fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
-    let panes = Layout::horizontal([
-        Constraint::Percentage(28),
-        Constraint::Percentage(44),
-        Constraint::Percentage(28),
-    ])
-    .split(chunks[0]);
+    let body = chunks[0];
 
-    // 左列だけを上下に分割する（社員 60% / タスク 40%）。全3列の幅は変えない。
-    let left =
-        Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).split(panes[0]);
-
-    draw_employees(frame, left[0], app);
-    draw_tasks(frame, left[1], app);
-    draw_notices(frame, panes[1], app);
-    draw_mgr(frame, panes[2], app);
+    // 幅に応じて出すペインを減らす。狭い端末で空の枠を残さない。
+    if body.width >= THREE_PANE_MIN_WIDTH {
+        let panes = Layout::horizontal([
+            Constraint::Min(LEFT_MIN_WIDTH),
+            Constraint::Percentage(44),
+            Constraint::Min(RIGHT_MIN_WIDTH),
+        ])
+        .split(body);
+        draw_left_column(frame, panes[0], app);
+        draw_notices(frame, panes[1], app);
+        draw_mgr(frame, panes[2], app);
+    } else if body.width >= TWO_PANE_MIN_WIDTH {
+        let panes = Layout::horizontal([
+            Constraint::Min(LEFT_MIN_WIDTH),
+            Constraint::Min(CENTER_MIN_WIDTH),
+        ])
+        .split(body);
+        draw_left_column(frame, panes[0], app);
+        draw_notices(frame, panes[1], app);
+    } else {
+        // 極端に狭いときは #会議室 だけを全幅で見せる。
+        draw_notices(frame, body, app);
+    }
     draw_input(frame, chunks[1], app);
+}
+
+/// 左列を上下に分割する（社員 上 / タスク 下）。両方に最低数行を確保する。
+fn draw_left_column(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Min(2)]).split(area);
+    draw_employees(frame, rows[0], app);
+    draw_tasks(frame, rows[1], app);
 }
 
 fn draw_employees(frame: &mut Frame, area: Rect, app: &App) {
@@ -744,42 +822,109 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_notices(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::bordered().title(Line::styled(
-        DEFAULT_CHANNEL,
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
+    let scroll = app.scroll;
+    let title = if scroll == 0 {
+        Line::styled(
+            DEFAULT_CHANNEL,
+            Style::default().add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Line::from(vec![
+            Span::styled(
+                DEFAULT_CHANNEL,
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  ▲ 上に {scroll} 件 (End で最新)"),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])
+    };
+    let block = Block::bordered().title(title);
     let inner = block.inner(area);
+    let width = inner.width as usize;
+    let height = inner.height as usize;
 
-    let lines: Vec<Line> = app
-        .notices
-        .iter()
-        .map(|n| {
-            if n.local {
-                // 送信エコー / ヘルプ / システム行は一目で区別できるよう色を変える。
-                Line::from(Span::styled(
-                    n.text.clone(),
-                    Style::default().fg(Color::Cyan),
-                ))
-            } else {
-                // 送信者は太字、本文は通常。
-                Line::from(vec![
-                    Span::styled(
-                        format!("{}: ", n.from),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(n.text.clone()),
-                ])
-            }
-        })
-        .collect();
+    // スクロール位置の分だけ新しい側を切り離し、内側幅で折り返して描く。
+    // 位置は「下（最新）からの件数」なので、新着が来ても相対位置は変わらない。
+    let end = app.notices.len().saturating_sub(scroll);
+    let mut lines: Vec<Line> = Vec::new();
+    for notice in &app.notices[..end] {
+        lines.extend(notice_lines(notice, width));
+    }
+
+    // 折り返し後の行数で最下部に合わせる（0 件・高さ 0 でも saturating_sub で安全）。
     let total = lines.len();
-    let offset = total.saturating_sub(inner.height as usize) as u16;
+    let offset = total.saturating_sub(height);
+    let offset = offset.min(u16::MAX as usize) as u16;
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((offset, 0));
+    let paragraph = Paragraph::new(lines).block(block).scroll((offset, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// notice 1 件を、内側幅 `width` で折り返した行へ変換する。
+fn notice_lines(notice: &NoticeLine, width: usize) -> Vec<Line<'static>> {
+    if notice.local {
+        // 送信エコー / ヘルプ / システム行は一目で区別できるよう色を変える。
+        wrap_styled(
+            &[(notice.text.clone(), Style::default().fg(Color::Cyan))],
+            width,
+        )
+    } else {
+        // 送信者は太字、本文は通常。
+        wrap_styled(
+            &[
+                (
+                    format!("{}: ", notice.from),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                (notice.text.clone(), Style::default()),
+            ],
+            width,
+        )
+    }
+}
+
+/// スタイル付きのテキスト片を表示幅 `width` で折り返して行に変換する。
+///
+/// 改行 `\n` は強制改行として扱う。単語境界は考慮せず表示幅（全角は 2）で
+/// 分割する。幅 0 でも 1 行は返し、呼び側が空表示を安全に扱えるようにする。
+fn wrap_styled(parts: &[(String, Style)], width: usize) -> Vec<Line<'static>> {
+    let max = width.max(1);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut w = 0usize;
+
+    for (text, style) in parts {
+        let mut buf = String::new();
+        for ch in text.chars() {
+            if ch == '\n' {
+                if !buf.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut buf), *style));
+                }
+                lines.push(Line::from(std::mem::take(&mut spans)));
+                w = 0;
+                continue;
+            }
+            let cw = ch.width().unwrap_or(0);
+            // 幅を超える前に改行する（行頭の 1 文字は必ず置く）。
+            if w + cw > max && w > 0 {
+                if !buf.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut buf), *style));
+                }
+                lines.push(Line::from(std::mem::take(&mut spans)));
+                w = 0;
+            }
+            buf.push(ch);
+            w += cw;
+        }
+        if !buf.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut buf), *style));
+        }
+    }
+
+    lines.push(Line::from(spans));
+    lines
 }
 
 fn draw_mgr(frame: &mut Frame, area: Rect, app: &App) {
@@ -836,9 +981,14 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let status_width = (UnicodeWidthStr::width(status_text.as_str()) as u16)
         .min(MAX_STATUS_WIDTH)
         .min(area.width.saturating_sub(1));
-    // プロンプト領域を最低1桁残してからヒント幅を決める（狭い端末でも安全）。
+    // ヒントは上限を設け、入力欄を最低限確保してから残り幅をあてる。
     let hint_width = (UnicodeWidthStr::width(INPUT_HINT) as u16)
-        .min(area.width.saturating_sub(status_width).saturating_sub(1));
+        .min(HINT_MAX_WIDTH)
+        .min(
+            area.width
+                .saturating_sub(status_width)
+                .saturating_sub(INPUT_MIN_WIDTH),
+        );
 
     let cols = Layout::horizontal([
         Constraint::Min(1),
@@ -1029,8 +1179,8 @@ fn env_string(key: &str, default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ConnectionStatus, InputAction, apply_input_key, backoff_delay, parse_input,
-        status_display, task_status_prefix, task_summary_lines, truncate_to_width,
+        App, ConnectionStatus, HELP_LINES, InputAction, apply_input_key, backoff_delay,
+        parse_input, status_display, task_status_prefix, task_summary_lines, truncate_to_width,
     };
     use crossterm::event::{KeyCode, KeyModifiers};
     use protocol::{EmployeeInfo, ServerMsg, TaskInfo};
@@ -1332,7 +1482,7 @@ mod tests {
         // 下部の入力行とヒント。
         assert!(compact.contains(">/taskレポート"), "{view}");
         assert!(compact.contains("[Enter]送信"), "{view}");
-        assert!(compact.contains("[/quitorEsc]終了"), "{view}");
+        assert!(compact.contains("[PgUp/PgDn]スクロール"), "{view}");
     }
 
     #[test]
@@ -1361,5 +1511,137 @@ mod tests {
         for (w, h) in [(1u16, 1u16), (5, 3), (10, 4), (20, 5)] {
             let _ = render_to_string(&App::default(), w, h);
         }
+    }
+
+    #[test]
+    fn scroll_clamps_and_handles_empty() {
+        let mut app = App::default();
+        // 0 件でも何をしても安全。
+        app.scroll_up(10);
+        assert_eq!(app.scroll, 0);
+        app.scroll_to_oldest();
+        assert_eq!(app.scroll, 0);
+
+        for i in 0..5 {
+            app.push_local(format!("m{i}"));
+        }
+        assert_eq!(app.scroll, 0);
+
+        app.scroll_up(2);
+        assert_eq!(app.scroll, 2);
+        app.scroll_down(1);
+        assert_eq!(app.scroll, 1);
+        app.scroll_down(100);
+        assert_eq!(app.scroll, 0);
+
+        // 上限は「件数 - 1」（最古）。
+        app.scroll_up(100);
+        assert_eq!(app.scroll, 4);
+        app.scroll_to_newest();
+        assert_eq!(app.scroll, 0);
+        app.scroll_to_oldest();
+        assert_eq!(app.scroll, 4);
+    }
+
+    #[test]
+    fn new_messages_follow_at_bottom_and_keep_position_when_scrolled() {
+        let mut app = App::default();
+        for i in 0..5 {
+            app.push_local(format!("m{i}"));
+        }
+        // 最新追従中（offset 0）は新着が来ても追従する。
+        app.push_local("new".to_string());
+        assert_eq!(app.scroll, 0);
+
+        // スクロール中は相対位置を保つ。
+        app.scroll_up(2);
+        app.push_local("newer".to_string());
+        assert_eq!(app.scroll, 2);
+    }
+
+    #[test]
+    fn scroll_keys_do_not_modify_input_buffer() {
+        let mut buf = String::from("abc");
+        for code in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            apply_input_key(&mut buf, code, KeyModifiers::NONE);
+        }
+        assert_eq!(buf, "abc");
+    }
+
+    #[test]
+    fn addressed_say_is_sent_as_is() {
+        // `@id` はサーバーが解釈するので、そのまま say として送る。
+        assert_eq!(
+            parse_input("@mgr 点呼"),
+            InputAction::Say("@mgr 点呼".to_string())
+        );
+        assert_eq!(
+            parse_input("@all 集合"),
+            InputAction::Say("@all 集合".to_string())
+        );
+    }
+
+    #[test]
+    fn help_mentions_addresses_and_scroll_keys() {
+        let help = HELP_LINES.join("\n");
+        assert!(help.contains("@mgr"), "{help}");
+        assert!(help.contains("@all"), "{help}");
+        for key in ["PageUp", "PageDown", "Home", "End", "/task", "/quit"] {
+            assert!(help.contains(key), "missing {key}: {help}");
+        }
+    }
+
+    #[test]
+    fn draw_keeps_messages_pane_on_small_terminals() {
+        for (w, h) in [(20u16, 8u16), (30, 10), (40, 12)] {
+            let mut app = App::default();
+            app.push_local("こんにちは".to_string());
+            let view = render_to_string(&app, w, h);
+            let compact: String = view.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(compact.contains("#会議室"), "{w}x{h}:\n{view}");
+        }
+    }
+
+    #[test]
+    fn draw_hides_right_pane_on_narrow_terminals() {
+        let app = App {
+            online: vec!["mgr".to_string()],
+            ..App::default()
+        };
+        // 狭い（2 ペイン未満）ときは mgr ペインを出さない。
+        let narrow = render_to_string(&app, 20, 8);
+        let compact: String = narrow.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("#会議室"), "{narrow}");
+        assert!(!compact.contains("学:"), "{narrow}");
+
+        // 広いときは mgr ペイン（学/状態/関係）を出す。
+        let wide = render_to_string(&app, 100, 30);
+        let compact: String = wide.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("学:-"), "{wide}");
+        assert!(compact.contains("状態:-"), "{wide}");
+        assert!(compact.contains("関係:"), "{wide}");
+    }
+
+    #[test]
+    fn draw_shows_scroll_indicator_when_scrolled() {
+        let mut app = App::default();
+        for i in 0..30 {
+            app.push_local(format!("m{i}"));
+        }
+        // 最新追従中はインジケータを出さない。
+        let bottom = render_to_string(&app, 100, 30);
+        let compact: String = bottom.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(!compact.contains("上に"), "{bottom}");
+
+        app.scroll_up(3);
+        let scrolled = render_to_string(&app, 100, 30);
+        let compact: String = scrolled.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("上に3件"), "{scrolled}");
+        assert!(compact.contains("Endで最新"), "{scrolled}");
     }
 }

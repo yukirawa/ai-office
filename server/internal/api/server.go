@@ -52,6 +52,7 @@ type Server struct {
 	mu          sync.RWMutex
 	manager     *agents.Manager
 	chat        *agents.ChatAgent
+	employees   map[string]agents.Agent
 	agentStates map[string]string
 	ghClient    gh.Client
 	llmClient   llm.Client
@@ -76,6 +77,7 @@ func New(d Deps) *Server {
 		hub:         newHub(),
 		manager:     d.Manager,
 		agentStates: make(map[string]string),
+		employees:   make(map[string]agents.Agent),
 		llmClient:   d.LLM,
 		waiters:     make(map[string]*waiter),
 	}
@@ -231,6 +233,12 @@ func (s *Server) Handler() http.Handler {
 
 	// §4.3 /api/ledger/:id
 	r.Get("/api/ledger/{id}", s.handleLedger)
+
+	// 経済（Phase 5）
+	r.Get("/api/ledger", s.handleLedgerAll)
+	r.Get("/api/ledger/{id}/entries", s.handleLedgerEntries)
+	r.Post("/api/economy/purchase", s.handlePurchase)
+	r.Get("/api/economy/status", s.handleEconomyStatus)
 
 	// 関係値（設計書 §5 の relationships。TUI 右ペイン用の拡張エンドポイント）
 	r.Get("/api/relationships/{id}", s.handleRelationships)

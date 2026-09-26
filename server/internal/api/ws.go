@@ -363,14 +363,13 @@ func (s *Server) readLoop(ctx context.Context, cl *client) string {
 			if err := s.Notify(ctx, channel, cl.employeeID, text); err != nil {
 				s.log.Warn("say の投稿に失敗しました", "employee_id", cl.employeeID, "error", err)
 			}
-			// chat 役がいればその発言を渡して応答させる（§15.1）。
-			if chat := s.chatAgent(); chat != nil {
-				if !chat.Post(text) {
-					s.log.Warn("chat 役の受信箱が満杯のため発言を渡せませんでした", "employee_id", cl.employeeID)
-				}
-			}
+			// @宛先（@mgr / @dev_m / @chat / @all）に応じて会話を振り分ける。
+			// メンション無しは chat 役に渡す（§15.1）。
+			target, body := parseMention(text)
+			s.dispatchMention(channel, target, body)
 			s.log.Info("say を受信しました",
-				"employee_id", cl.employeeID, "channel", channel, "text", truncateRunes(text, 80))
+				"employee_id", cl.employeeID, "channel", channel, "target", target,
+				"text", truncateRunes(text, 80))
 		case "task":
 			var tm taskMsg
 			if err := json.Unmarshal(data, &tm); err != nil {
@@ -442,6 +441,11 @@ func (s *Server) sendHistory(cl *client) {
 		return
 	}
 	for _, m := range msgs {
+		// 過去の出退勤（system の入退室）は履歴に出さない。
+		// 毎回の接続で大量に再生されて見づらくなるため（特に再起動後）。
+		if isPresenceNoise(m.FromID, m.Content) {
+			continue
+		}
 		s.sendJSON(cl, noticeMsg{
 			Type:    "notice",
 			Channel: m.Channel,
@@ -449,6 +453,21 @@ func (s *Server) sendHistory(cl *client) {
 			Text:    m.Content,
 			TS:      formatTS(m.TS),
 		})
+	}
+}
+
+// isPresenceNoise は履歴から除外すべき入退室通知かを判定する。
+func isPresenceNoise(fromID, content string) bool {
+	if fromID != notifyFromDefault {
+		return false
+	}
+	switch {
+	case strings.Contains(content, "出勤しました"),
+		strings.Contains(content, "退勤しました"),
+		strings.Contains(content, "退勤扱いにしました"):
+		return true
+	default:
+		return false
 	}
 }
 

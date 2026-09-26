@@ -29,6 +29,10 @@ const (
 	defaultAnthropicBaseURL = "https://api.anthropic.com"
 	defaultDeepSeekBaseURL  = "https://api.deepseek.com"
 	defaultDeepSeekModel    = "deepseek-chat"
+	defaultPremiumModel     = "deepseek-reasoner"
+	defaultPremiumPrice     = 100
+	defaultInequalityCron   = "0 * * * *"
+	defaultInequalityThresh = 500
 	defaultMaxAgentTurns    = 8
 	defaultTokenBudget      = 20000
 	defaultLogLevel         = "info"
@@ -107,6 +111,17 @@ type Config struct {
 	GitHubRepo string
 	// GitHubBaseBranch は PR のベースブランチ（env GITHUB_BASE_BRANCH）。
 	GitHubBaseBranch string
+
+	// ---- Phase 5: 経済・社会 ----
+
+	// PremiumModel は高級モデル購入で使うモデル名（env OFFICE_PREMIUM_MODEL）。
+	PremiumModel string
+	// PremiumModelPrice は高級モデルの購入価格（学）（env OFFICE_PREMIUM_MODEL_PRICE）。
+	PremiumModelPrice int
+	// InequalityCron は格差観察の cron 式（env OFFICE_INEQUALITY_CRON、off で無効）。
+	InequalityCron string
+	// InequalityThreshold は格差アラートを出す残高の差（env OFFICE_INEQUALITY_THRESHOLD）。
+	InequalityThreshold int
 }
 
 // Load は環境変数から Config を読み込む。
@@ -140,6 +155,14 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	ghInstallationID, err := int64Env("GITHUB_INSTALLATION_ID", 0)
+	if err != nil {
+		return nil, err
+	}
+	premiumPrice, err := intEnv("OFFICE_PREMIUM_MODEL_PRICE", defaultPremiumPrice)
+	if err != nil {
+		return nil, err
+	}
+	inequalityThreshold, err := intEnv("OFFICE_INEQUALITY_THRESHOLD", defaultInequalityThresh)
 	if err != nil {
 		return nil, err
 	}
@@ -198,6 +221,10 @@ func Load() (*Config, error) {
 		GitHubWebhookSecret:  os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		GitHubRepo:           strings.TrimSpace(os.Getenv("GITHUB_REPO")),
 		GitHubBaseBranch:     stringEnv("GITHUB_BASE_BRANCH", "main"),
+		PremiumModel:         stringEnv("OFFICE_PREMIUM_MODEL", defaultPremiumModel),
+		PremiumModelPrice:    premiumPrice,
+		InequalityCron:       stringEnv("OFFICE_INEQUALITY_CRON", defaultInequalityCron),
+		InequalityThreshold:  inequalityThreshold,
 	}, nil
 }
 
@@ -214,6 +241,11 @@ func (c *Config) ChatCronEnabled() bool {
 // PayrollCronEnabled は日割り給与 cron が有効かを返す。空文字・"off"/"none"/"disabled" は無効。
 func (c *Config) PayrollCronEnabled() bool {
 	return cronEnabled(c.PayrollCron)
+}
+
+// InequalityCronEnabled は格差観察 cron が有効かを返す。
+func (c *Config) InequalityCronEnabled() bool {
+	return cronEnabled(c.InequalityCron)
 }
 
 // cronEnabled は cron 式が有効（登録すべき）かを判定する。

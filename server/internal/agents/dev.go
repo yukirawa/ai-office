@@ -64,6 +64,9 @@ type DevAgent struct {
 
 	mu    sync.RWMutex
 	state string
+
+	// models は実行時に差し替え可能なモデル名を保持する（Phase 5 の高級モデル購入）。
+	models modelState
 }
 
 // NewDevAgent は DevAgent を生成する。Run を別 goroutine で呼ぶまでタスクは処理されない。
@@ -87,8 +90,16 @@ func NewDevAgent(id string, p persona.Persona, client llm.Client, notifier Notif
 		reviewer:   reviewer,
 		inbox:      make(chan Task, inboxCapacity),
 		state:      StateIdle,
+		models:     newModelState(opts.Model),
 	}
 }
+
+// SetModel は実行時に使うモデルを差し替える（Modeler、Phase 5）。
+// 空文字は設定既定（Options.Model、無ければ DefaultModel）へ戻す。
+func (d *DevAgent) SetModel(model string) { d.models.set(model) }
+
+// Model は現在使うモデル名を返す（スレッドセーフ）。
+func (d *DevAgent) Model() string { return d.models.get() }
 
 // ID は社員 ID を返す。
 func (d *DevAgent) ID() string { return d.id }
@@ -118,11 +129,11 @@ func (d *DevAgent) Post(t Task) (ok bool) {
 	}
 }
 
-// Run は Inbox を処理し続ける。起動時に出勤を通知し状態を idle にする。
+// Run は Inbox を処理し続ける。起動時に状態を idle にする。
+// 出勤の挨拶は worker 側が行うため、ここでは重複する通知を出さない。
 func (d *DevAgent) Run(ctx context.Context) {
 	d.setState(StateIdle)
 	d.logger().Info("dev エージェントを起動しました", "id", d.id, "name", d.name)
-	d.notify(ctx, fmt.Sprintf("【出勤】%s (%s) が出勤しました。タスクをお待ちしています。", d.name, d.id))
 
 	for {
 		select {
@@ -264,7 +275,7 @@ func (d *DevAgent) buildAssign(ctx context.Context, t Task) (TaskAssign, string)
 // 無限ループ防止（最大ターン数・トークン予算・同一結論検出）を mgr と同じ規律で適用する。
 func (d *DevAgent) planWithLLM(ctx context.Context, t Task, remote bool) ([]Action, []RemoteFile, string) {
 	req := llm.Request{
-		Model:     d.opts.Model,
+		Model:     d.Model(),
 		System:    d.systemPrompt(remote),
 		Messages:  []llm.Message{{Role: "user", Content: assignPrompt(t, remote)}},
 		MaxTokens: d.opts.MaxTokens,
@@ -340,6 +351,41 @@ func (d *DevAgent) systemPrompt(remote bool) string {
 	}
 	parts = append(parts, instruction, devJSONOnlyInstruction)
 	return strings.Join(parts, "\n\n")
+}
+
+// converseSystemPrompt はペルソナに会話用の指示を足して返す（Converse 用）。
+func (d *DevAgent) converseSystemPrompt() string {
+	return buildConverseSystemPrompt(d.persona.SystemPrompt(), d.name)
+}
+
+// Converse は #会議室 などでの 1 往復の会話に応答する（Converser）。
+// タスク受信箱とは独立に、その場で LLM を呼んでチャンネルへ投稿する。
+func (d *DevAgent) Converse(ctx context.Context, channel, prompt string) {
+	if strings.TrimSpace(channel) == "" {
+		channel = d.opts.Channel
+	}
+	ctx, cancel := context.WithTimeout(ctx, converseTimeout(d.opts))
+	defer cancel()
+
+	d.setState(StateThinking)
+	if d.client == nil {
+		d.logger().Error("LLM クライアントが未設定のため会話に応答できません", "id", d.id)
+		d.setState(StateIdle)
+		return
+	}
+
+	text, ok := converseRun(ctx, d.client, d.logger(), d.id, d.Model(), d.converseSystemPrompt(), prompt, d.opts)
+	if !ok {
+		d.setState(StateIdle)
+		return
+	}
+
+	reply := sanitizeChatReply(text)
+	if reply == "" {
+		reply = converseFallbackReply
+	}
+	d.notifyChannel(ctx, channel, reply)
+	d.setState(StateIdle)
 }
 
 // assignPrompt はタスクを LLM に渡すユーザーメッセージに整形する。
@@ -534,13 +580,18 @@ func (d *DevAgent) setState(s string) {
 	}
 }
 
-// notify はチャンネルへ投稿する。エラーはログに記録して握りつぶす。
+// notify は既定チャンネル（Options.Channel）へ投稿する。
 func (d *DevAgent) notify(ctx context.Context, text string) {
+	d.notifyChannel(ctx, d.opts.Channel, text)
+}
+
+// notifyChannel は指定チャンネルへ投稿する。エラーはログに記録して握りつぶす。
+func (d *DevAgent) notifyChannel(ctx context.Context, channel, text string) {
 	if d.notifier == nil {
 		return
 	}
-	if err := d.notifier.Notify(ctx, d.opts.Channel, d.id, text); err != nil {
-		d.logger().Error("通知の投稿に失敗しました", "channel", d.opts.Channel, "error", err)
+	if err := d.notifier.Notify(ctx, channel, d.id, text); err != nil {
+		d.logger().Error("通知の投稿に失敗しました", "channel", channel, "error", err)
 	}
 }
 

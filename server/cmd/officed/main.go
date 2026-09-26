@@ -248,6 +248,13 @@ func run() error {
 		agentOptions(cfg, logger),
 	)
 	srv.SetChat(chat)
+	// @宛先（@mgr / @dev_m / @chat / @all）で会話できるように登録する。
+	srv.SetAgents(map[string]agents.Agent{
+		config.EmployeeManagerID: mgr,
+		config.EmployeeDevMID:    devM,
+		config.EmployeeDevFID:    devF,
+		config.EmployeeChatID:    chat,
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -266,6 +273,10 @@ func run() error {
 	// ---- 雑談 cron（Phase 4.4） ----
 	chatScheduler := startChatCron(ctx, cfg, chat, logger)
 	defer chatScheduler.Stop()
+
+	// ---- 格差の観察 cron（Phase 5.3、観察のみ） ----
+	inequalityScheduler := startInequalityCron(ctx, cfg, srv, logger)
+	defer inequalityScheduler.Stop()
 
 	// ---- HTTP / WebSocket ----
 	httpServer := &http.Server{
@@ -433,6 +444,30 @@ func startPayrollCron(
 	}
 	c.Start()
 	logger.Info("日割り給与 cron を開始しました", "cron", cfg.PayrollCron, "tz", loc.String())
+	return c
+}
+
+// startInequalityCron は格差の観察 cron を開始する（Phase 5.3、観察のみ）。
+func startInequalityCron(
+	ctx context.Context,
+	cfg *config.Config,
+	srv *api.Server,
+	logger *slog.Logger,
+) *cron.Cron {
+	c := cron.New()
+	if !cfg.InequalityCronEnabled() {
+		logger.Info("格差観察 cron は無効です", "cron", cfg.InequalityCron)
+		return c
+	}
+	_, err := c.AddFunc(cfg.InequalityCron, func() {
+		srv.ObserveInequality(ctx)
+	})
+	if err != nil {
+		logger.Error("格差観察 cron の登録に失敗しました", "cron", cfg.InequalityCron, "error", err)
+		return c
+	}
+	c.Start()
+	logger.Info("格差観察 cron を開始しました", "cron", cfg.InequalityCron, "threshold", cfg.InequalityThreshold)
 	return c
 }
 

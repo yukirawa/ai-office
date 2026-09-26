@@ -571,6 +571,36 @@ Phase 0 の TUI は read-only だったため、クライアント画面から�
 ### 15.2 TUI の操作
 
 - 下部に入力行。`Enter` で送信。
-- `/(スラッシュ)コマンド: `/task <タイトル>` でタスク投入、`/help` でヘルプ、`/quit` で終了。
-- 上記以外は `say`（#会議室 への発言）。chat 役が応答する。
+- スラッシュコマンド: `/task <タイトル>` でタスク投入、`/help` でヘルプ、`/quit` で終了。
+- `@mgr` / `@dev_m` / `@dev_f` / `@chat` / `@all` を本文先頭に書くと、その社員が応答する。
+- スクロール: `PageUp` / `PageDown` / `Home` / `End`。
 - 終了は `Esc` または `Ctrl-C`（`q` は入力文字として扱う）。
+
+---
+
+## 16. Phase 5（経済・社会）
+
+### 16.1 #会議室 の @宛先（§15 の拡張）
+
+- `@mgr 本文` / `@dev_m 本文` / `@dev_f 本文` / `@chat 本文` … その社員が 1 往復で応答する。
+- `@all 本文` … 全員が応答する（点呼など）。
+- 宛先なし … chat 役が応答する（従来どおり）。
+- 実装: `agents.Converser`（mgr / dev / chat が実装）を api に登録し、`say` の本文先頭の `@id` で振り分ける。
+  実行時モデル差し替え用に `agents.Modeler`（SetModel/Model）も実装。
+
+### 16.2 経済 API
+
+- `GET  /api/ledger` 全社員の残高
+- `GET  /api/ledger/:id/entries?limit=` 元帳履歴
+- `POST /api/economy/purchase {employee_id, model?}` 高級モデル購入（残高を消費し、その社員のモデルを実行時差し替え）
+- `GET  /api/economy/status` 残高分布（min/max/spread/alert）
+- 価格は `OFFICE_PREMIUM_MODEL_PRICE`、対象モデルは `OFFICE_PREMIUM_MODEL`。
+- 格差観察 cron（`OFFICE_INEQUALITY_CRON`）: spread が `OFFICE_INEQUALITY_THRESHOLD` 以上なら通知する
+  （**観察のみ**で行動はしない。労働運動トリガーはこの観察から将来実装）。
+
+### 16.3 実務向けの既定
+
+- worker の `exec` は `OFFICE_ALLOW_EXEC=1` で許可（`.env` で既定有効にした）。サンドボックスは
+  `OFFICE_SANDBOX`（`bwrap` / `none`）。
+- 接続時の履歴には system の入退室通知を含めない（再起動後の見づらさ対策）。
+- dev エージェントの起動時 `【出勤】` 挨拶は削除（worker の check-in 通知と重複するため）。

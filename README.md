@@ -94,15 +94,18 @@ TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: 
 | --- | --- |
 | `Enter` | 送信 |
 | 文字入力 | 入力行に追加（`q` も文字として入力される） |
+| `PageUp` / `PageDown` / `Home` / `End` | `#会議室` をスクロール / 先頭 / 最新へ |
 | `Backspace` / `Ctrl-U` | 1 文字削除 / 全消去 |
 | `Esc` / `Ctrl-C` | 終了 |
 | 通常のテキスト | `#会議室` へ発言（`say`）。chat 役が返信する |
+| `@mgr 〜` / `@dev_m 〜` / `@dev_f 〜` / `@chat 〜` | その社員が応答する |
+| `@all 〜` | 全員が応答する（点呼など） |
 | `/task <タイトル>` | タスクを投入（`POST /api/tasks` と同じ経路。mgr が計画→dev が実行） |
 | `/help` | コマンド一覧を表示 |
 | `/quit` | 終了 |
 
-例: `おはよう` → 会議室に投稿され chat が応答。`/task ログイン画面を作る` → mgr が計画し
-dev_m / dev_f に割当て、worker が実行する。
+例: `おはよう` → 会議室に投稿され chat が応答。`@all 点呼です` → mgr / dev_m / dev_f / chat がそれぞれ応答。
+`/task ログイン画面を作る` → mgr が計画し dev_m / dev_f に割当て、worker が実行する。
 
 ## 手動で起動する
 
@@ -150,7 +153,8 @@ POST /api/tasks
 worker の実行モード:
 
 - **local**: `{"actions":[{"op":"read|write|list|exec",...}]}` をワークスペース内で実行。
-  パスはワークスペース外へ出られない（`..` や絶対パスは拒否）。`exec` は既定で無効。
+  パスはワークスペース外へ出られない（`..` や絶対パスは拒否）。`exec` は `.env` の
+  `OFFICE_ALLOW_EXEC=1` で許可（コードの書き込みだけなら不要、実行までするなら必要）。
 - **remote**: GitHub REST API でブランチ作成 → コミット → PR 作成。サーバーが発行した
   短命の installation token を `task_assign` の payload で受け取る。worker がオフラインの
   ときはサーバー側（`gh`）が PR を作る。
@@ -368,6 +372,10 @@ worker の追加設定:
 | POST | `/api/tasks` | オーナーからのタスク投入（`title`/`description`/`from`/`mode`/`repo`/`base_branch`） |
 | GET | `/api/tasks` | タスク一覧（`?status=&limit=`） |
 | POST | `/api/chat` | オーナーの発言に chat 役が応答 |
+| GET | `/api/ledger` | 全社員の残高（Phase 5） |
+| GET | `/api/ledger/:id/entries` | 元帳履歴（Phase 5） |
+| POST | `/api/economy/purchase` | 高級モデル購入（Phase 5） |
+| GET | `/api/economy/status` | 残高分布・格差（Phase 5） |
 | GET | `/api/llm` | LLM プロバイダ/モデル/設定の表示 |
 | POST | `/api/llm/ping` | LLM へ 1 回だけ問い合わせて疎通確認 |
 | POST | `/webhook/github` | GitHub webhook（署名検証 → タスク化） |
@@ -378,5 +386,6 @@ worker の追加設定:
 - **Phase 1（完了）**: SQLite store / LLM HTTP ラッパー（Anthropic + mock）/ mgr エージェント（計画）/ 日割り給与 cron
 - **Phase 2（完了）**: `task_assign`/`task_result` / worker Local モード（ファイル操作）/ bubblewrap サンドボックス / dev_m・dev_f エージェント（mgr がラウンドロビン割当 → レビュー）
 - **Phase 3（実装済み・要資格情報）**: GitHub App 認証（JWT → installation token）/ worker Remote モード（ブランチ → コミット → PR）/ webhook 署名検証 → タスク化 / worker 不在時のサーバー側 PR 作成
-- **Phase 4（完了）**: ペルソナ（既存 + chat 役）/ 関係値システム（タスク結果で変動）/ chat 役（Ollama なし）/ 雑談 cron / TUI のタスクペイン
+- **Phase 4（完了）**: ペルソナ（既存 + chat 役）/ 関係値システム（タスク結果で変動）/ chat 役（Ollama なし）/ 雑談 cron / TUI のタスクペイン・入力行・スクロール・@宛先
+- **Phase 5（実装済み）**: 学の元帳/残高 API・高級モデル購入（実行時モデル差し替え）・格差の観察（観察のみ）。次は労働運動トリガーの具体化・高級モデル価格の調整・Web UI（Phase 6）
 - 次は Phase 5（学の元帳・残高API、高級モデル購入、労働運動トリガーの観察）

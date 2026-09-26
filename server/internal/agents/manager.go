@@ -116,6 +116,9 @@ type Manager struct {
 
 	mu    sync.RWMutex
 	state string
+
+	// models は実行時に差し替え可能なモデル名を保持する（Phase 5 の高級モデル購入）。
+	models modelState
 }
 
 // NewManager は Manager を生成する。Run を別 goroutine で呼ぶまでタスクは処理されない。
@@ -136,9 +139,17 @@ func NewManager(id string, p persona.Persona, client llm.Client, notifier Notifi
 			Inbox:   make(chan Task, inboxCapacity),
 			State:   StateIdle,
 		},
-		state: StateIdle,
+		state:  StateIdle,
+		models: newModelState(opts.Model),
 	}
 }
+
+// SetModel は実行時に使うモデルを差し替える（Modeler、Phase 5）。
+// 空文字は設定既定（Options.Model、無ければ DefaultModel）へ戻す。
+func (m *Manager) SetModel(model string) { m.models.set(model) }
+
+// Model は現在使うモデル名を返す（スレッドセーフ）。
+func (m *Manager) Model() string { return m.models.get() }
 
 // normalizeOptions はゼロ値を既定値で埋める。呼び出し側の Options は変更しない。
 func normalizeOptions(opts Options) Options {
@@ -299,7 +310,7 @@ func (m *Manager) handleTask(ctx context.Context, t Task) {
 	}
 
 	req := llm.Request{
-		Model:     m.opts.Model,
+		Model:     m.Model(),
 		System:    m.systemPrompt(),
 		Messages:  []llm.Message{{Role: "user", Content: taskPrompt(t)}},
 		MaxTokens: m.opts.MaxTokens,
@@ -482,6 +493,41 @@ func (m *Manager) systemPrompt() string {
 	return base + "\n\n" + planningInstruction
 }
 
+// converseSystemPrompt はペルソナに会話用の指示を足して返す（Converse 用）。
+func (m *Manager) converseSystemPrompt() string {
+	return buildConverseSystemPrompt(m.employee.Persona.SystemPrompt(), m.employee.Name)
+}
+
+// Converse は #会議室 などでの 1 往復の会話に応答する（Converser）。
+// タスク受信箱とは独立に、その場で LLM を呼んでチャンネルへ投稿する。
+func (m *Manager) Converse(ctx context.Context, channel, prompt string) {
+	if strings.TrimSpace(channel) == "" {
+		channel = m.opts.Channel
+	}
+	ctx, cancel := context.WithTimeout(ctx, converseTimeout(m.opts))
+	defer cancel()
+
+	m.setState(StateThinking)
+	if m.client == nil {
+		m.logger().Error("LLM クライアントが未設定のため会話に応答できません", "id", m.employee.ID)
+		m.setState(StateIdle)
+		return
+	}
+
+	text, ok := converseRun(ctx, m.client, m.logger(), m.employee.ID, m.Model(), m.converseSystemPrompt(), prompt, m.opts)
+	if !ok {
+		m.setState(StateIdle)
+		return
+	}
+
+	reply := sanitizeChatReply(text)
+	if reply == "" {
+		reply = converseFallbackReply
+	}
+	m.notifyChannel(ctx, channel, reply)
+	m.setState(StateIdle)
+}
+
 // setState は内部状態を更新し、Notifier に公開する。
 func (m *Manager) setState(s string) {
 	m.mu.Lock()
@@ -493,13 +539,18 @@ func (m *Manager) setState(s string) {
 	}
 }
 
-// notify はチャンネルへ投稿する。エラーはログに記録して握りつぶす。
+// notify は既定チャンネル（Options.Channel）へ投稿する。
 func (m *Manager) notify(ctx context.Context, text string) {
+	m.notifyChannel(ctx, m.opts.Channel, text)
+}
+
+// notifyChannel は指定チャンネルへ投稿する。エラーはログに記録して握りつぶす。
+func (m *Manager) notifyChannel(ctx context.Context, channel, text string) {
 	if m.notifier == nil {
 		return
 	}
-	if err := m.notifier.Notify(ctx, m.opts.Channel, m.employee.ID, text); err != nil {
-		m.logger().Error("通知の投稿に失敗しました", "channel", m.opts.Channel, "error", err)
+	if err := m.notifier.Notify(ctx, channel, m.employee.ID, text); err != nil {
+		m.logger().Error("通知の投稿に失敗しました", "channel", channel, "error", err)
 	}
 }
 
