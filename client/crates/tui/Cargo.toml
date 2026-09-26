@@ -11,5 +11,5 @@ futures-util = "0.3.34"
 protocol = { version = "0.1.0", path = "../protocol" }
 ratatui = "0.30.2"
 serde_json = "1.0.151"
-tokio = "1.53.1"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-tungstenite = "0.30.0"
