@@ -96,3 +96,27 @@ type byeMsg struct {
 	Type   string `json:"type"`
 	Reason string `json:"reason"`
 }
+
+// taskResultMsg は worker からの実行結果（§13.1）。
+type taskResultMsg struct {
+	Type      string        `json:"type"`
+	TaskID    string        `json:"task_id"`
+	Status    string        `json:"status"`
+	Summary   string        `json:"summary"`
+	Detail    string        `json:"detail"`
+	Artifacts []artifactMsg `json:"artifacts"`
+}
+
+// artifactMsg は task_result.artifacts[] の 1 要素。
+type artifactMsg struct {
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+}
+
+// taskProgressMsg は worker からの進捗（§13.1）。
+type taskProgressMsg struct {
+	Type    string `json:"type"`
+	TaskID  string `json:"task_id"`
+	Message string `json:"message"`
+	Percent int    `json:"percent"`
+}

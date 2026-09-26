@@ -22,6 +22,21 @@ pub enum ClientMsg {
     Heartbeat { ts: String },
     /// 明示的な退勤。
     Bye { reason: String },
+    /// タスクの実行結果（§13.1、Phase 2.2）。`status` は `done` | `failed`。
+    TaskResult {
+        task_id: String,
+        status: String,
+        summary: String,
+        detail: String,
+        #[serde(default)]
+        artifacts: Vec<Artifact>,
+    },
+    /// 実行中の進捗（§13.1、任意）。
+    TaskProgress {
+        task_id: String,
+        message: String,
+        percent: u8,
+    },
 }
 
 impl ClientMsg {
@@ -61,6 +76,8 @@ pub enum ServerMsg {
     },
     /// エラー応答。
     Error { code: String, message: String },
+    /// 割り当て済みタスクの取り消し（§13.2、予約）。
+    TaskCancel { task_id: String, reason: String },
     /// オフィス全体のスナップショット。
     OfficeState {
         #[serde(default)]
@@ -71,6 +88,9 @@ pub enum ServerMsg {
         ledger: BTreeMap<String, i64>,
         #[serde(default)]
         relationships: Vec<RelationshipInfo>,
+        /// タスク一覧。新しい順（newest-first）で、省略・空がありうる（§13.4 追補）。
+        #[serde(default)]
+        tasks: Vec<TaskInfo>,
         ts: String,
     },
     /// 未知の `type`。前方互換のためのフォールバック。
@@ -118,6 +138,97 @@ pub struct RelationshipInfo {
     pub affinity: i64,
     #[serde(default)]
     pub trust: i64,
+}
+
+/// `office_state.tasks[]`（§13.4 追補）。
+///
+/// 全フィールド省略可能（前方/後方互換）。`mode` は `local` | `remote`、
+/// `status` は §13.3 の状態遷移（`pending` / `assigned` / `working` / `review` / `done` / `failed`）を想定。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TaskInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub assignee: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub result: String,
+}
+
+/// local モードの 1 操作（§13.2）。
+///
+/// `op` は `read` | `write` | `list` | `exec`。用途が異なるフィールドは省略可能
+/// （例: `write` は `path`+`content`、`exec` は `cmd`+`args`+`cwd`）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Action {
+    pub op: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub cmd: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: String,
+}
+
+/// remote モードでプッシュする 1 ファイル（§13.2）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RemoteFile {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub content: String,
+}
+
+/// remote モードの GitHub 操作指定（§13.2）。`token` は省略・空がありうる。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RemoteSpec {
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub base_branch: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub files: Vec<RemoteFile>,
+    #[serde(default)]
+    pub token: String,
+}
+
+/// `task_assign.payload` を確定させたもの（§13.2、Phase 2.2）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TaskAssignPayload {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub actions: Vec<Action>,
+    #[serde(default)]
+    pub remote: Option<RemoteSpec>,
+}
+
+/// `task_result.artifacts[]`。書き込んだファイルとバイト数。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Artifact {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 #[cfg(test)]
@@ -216,6 +327,9 @@ mod tests {
             "relationships": [
                 {"from_id":"mgr","to_id":"dev_f","affinity":15,"trust":70}
             ],
+            "tasks": [
+                {"id":"t1","title":"レポート作成","status":"done","assignee":"dev_m","mode":"local","result":"ok"}
+            ],
             "ts": "2026-09-26T12:34:56Z"
         }"#;
         let msg = ServerMsg::parse(json).unwrap();
@@ -225,6 +339,7 @@ mod tests {
                 employees,
                 ledger,
                 relationships,
+                tasks,
                 ts,
             } => {
                 assert_eq!(online, vec!["mgr"]);
@@ -238,6 +353,9 @@ mod tests {
                 assert_eq!(relationships[0].to_id, "dev_f");
                 assert_eq!(relationships[0].affinity, 15);
                 assert_eq!(relationships[0].trust, 70);
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].id, "t1");
+                assert_eq!(tasks[0].status, "done");
                 assert_eq!(ts, "2026-09-26T12:34:56Z");
             }
             other => panic!("expected OfficeState, got {other:?}"),
@@ -255,12 +373,14 @@ mod tests {
                 employees,
                 ledger,
                 relationships,
+                tasks,
                 ts,
             } => {
                 assert!(online.is_empty());
                 assert!(employees.is_empty());
                 assert!(ledger.is_empty());
                 assert!(relationships.is_empty());
+                assert!(tasks.is_empty());
                 assert_eq!(ts, "x");
             }
             other => panic!("expected OfficeState, got {other:?}"),
@@ -273,6 +393,57 @@ mod tests {
         assert_eq!(e.id, "mgr");
         assert_eq!(e.state, "");
         assert_eq!(e.name, "");
+    }
+
+    #[test]
+    fn parse_office_state_with_tasks() {
+        // tasks は新しい順。全フィールドを読み取れること。
+        let json = r#"{
+            "type": "office_state",
+            "online": ["dev_m"],
+            "tasks": [
+                {"id":"t1","title":"レポート作成","status":"done","assignee":"dev_m","mode":"local","result":"done in 3s"},
+                {"id":"t2","title":"調査","status":"working","assignee":"dev_f","mode":"remote","result":""}
+            ],
+            "ts": "t"
+        }"#;
+        match ServerMsg::parse(json).unwrap() {
+            ServerMsg::OfficeState { tasks, .. } => {
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0].id, "t1");
+                assert_eq!(tasks[0].title, "レポート作成");
+                assert_eq!(tasks[0].status, "done");
+                assert_eq!(tasks[0].assignee, "dev_m");
+                assert_eq!(tasks[0].mode, "local");
+                assert_eq!(tasks[0].result, "done in 3s");
+                assert_eq!(tasks[1].id, "t2");
+                assert_eq!(tasks[1].status, "working");
+                assert_eq!(tasks[1].mode, "remote");
+            }
+            other => panic!("expected OfficeState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn office_state_without_tasks_is_empty() {
+        // tasks が無くてもパースでき、空 vec になる（後方互換）。
+        let json = r#"{"type":"office_state","online":["mgr"],"ts":"x"}"#;
+        match ServerMsg::parse(json).unwrap() {
+            ServerMsg::OfficeState { tasks, .. } => assert!(tasks.is_empty()),
+            other => panic!("expected OfficeState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_info_fields_default_to_empty() {
+        // 未知/省略フィールドは空文字にフォールバックする。
+        let t: TaskInfo = serde_json::from_str(r#"{"id":"t1"}"#).unwrap();
+        assert_eq!(t.id, "t1");
+        assert_eq!(t.title, "");
+        assert_eq!(t.status, "");
+        assert_eq!(t.assignee, "");
+        assert_eq!(t.mode, "");
+        assert_eq!(t.result, "");
     }
 
     #[test]
@@ -306,5 +477,129 @@ mod tests {
                 payload: serde_json::json!({}),
             }
         );
+    }
+
+    #[test]
+    fn task_result_json_is_exact() {
+        let msg = ClientMsg::TaskResult {
+            task_id: "t1".to_string(),
+            status: "done".to_string(),
+            summary: "3 アクションを実行しました".to_string(),
+            detail: "log".to_string(),
+            artifacts: vec![Artifact {
+                path: "reports/x.md".to_string(),
+                bytes: 123,
+            }],
+        };
+        let json = msg.to_json();
+        assert_eq!(
+            json,
+            r#"{"type":"task_result","task_id":"t1","status":"done","summary":"3 アクションを実行しました","detail":"log","artifacts":[{"path":"reports/x.md","bytes":123}]}"#
+        );
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn task_progress_json_is_exact() {
+        let msg = ClientMsg::TaskProgress {
+            task_id: "t1".to_string(),
+            message: "working".to_string(),
+            percent: 50,
+        };
+        let json = msg.to_json();
+        assert_eq!(
+            json,
+            r#"{"type":"task_progress","task_id":"t1","message":"working","percent":50}"#
+        );
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn parse_task_assign_local_payload() {
+        let json = r#"{
+            "type": "task_assign",
+            "task_id": "t1",
+            "payload": {
+                "mode": "local",
+                "title": "レポート作成",
+                "reason": "mgr の計画",
+                "actions": [
+                    {"op": "write", "path": "reports/x.md", "content": "hello"}
+                ]
+            }
+        }"#;
+        let msg = ServerMsg::parse(json).unwrap();
+        let ServerMsg::TaskAssign { task_id, payload } = msg else {
+            panic!("expected TaskAssign");
+        };
+        assert_eq!(task_id, "t1");
+        let payload: TaskAssignPayload = serde_json::from_value(payload).unwrap();
+        assert_eq!(payload.mode, "local");
+        assert_eq!(payload.title, "レポート作成");
+        assert_eq!(payload.reason, "mgr の計画");
+        assert!(payload.remote.is_none());
+        assert_eq!(payload.actions.len(), 1);
+        assert_eq!(payload.actions[0].op, "write");
+        assert_eq!(payload.actions[0].path, "reports/x.md");
+        assert_eq!(payload.actions[0].content, "hello");
+        // 未設定フィールドは既定値にフォールバックする。
+        assert!(payload.actions[0].args.is_empty());
+        assert_eq!(payload.actions[0].cwd, "");
+    }
+
+    #[test]
+    fn parse_task_assign_remote_payload() {
+        let json = r#"{
+            "type": "task_assign",
+            "task_id": "t2",
+            "payload": {
+                "mode": "remote",
+                "title": "PR",
+                "remote": {
+                    "repo": "owner/repo",
+                    "base_branch": "main",
+                    "branch": "ai-office/x",
+                    "title": "タイトル",
+                    "body": "本文",
+                    "files": [{"path": "docs/a.md", "content": "c"}]
+                }
+            }
+        }"#;
+        let msg = ServerMsg::parse(json).unwrap();
+        let ServerMsg::TaskAssign { task_id, payload } = msg else {
+            panic!("expected TaskAssign");
+        };
+        assert_eq!(task_id, "t2");
+        let payload: TaskAssignPayload = serde_json::from_value(payload).unwrap();
+        assert_eq!(payload.mode, "remote");
+        assert!(payload.actions.is_empty());
+        let remote = payload.remote.expect("remote spec");
+        assert_eq!(remote.repo, "owner/repo");
+        assert_eq!(remote.base_branch, "main");
+        assert_eq!(remote.branch, "ai-office/x");
+        assert_eq!(remote.files.len(), 1);
+        assert_eq!(remote.files[0].path, "docs/a.md");
+        // token は省略されており、既定で空文字になる。
+        assert_eq!(remote.token, "");
+    }
+
+    #[test]
+    fn parse_task_cancel() {
+        assert_eq!(
+            ServerMsg::parse(r#"{"type":"task_cancel","task_id":"t1","reason":"不要"}"#).unwrap(),
+            ServerMsg::TaskCancel {
+                task_id: "t1".to_string(),
+                reason: "不要".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn task_assign_payload_defaults() {
+        let payload: TaskAssignPayload = serde_json::from_str(r#"{"mode":"local"}"#).unwrap();
+        assert_eq!(payload.mode, "local");
+        assert!(payload.actions.is_empty());
+        assert!(payload.remote.is_none());
+        assert_eq!(TaskAssignPayload::default().mode, "");
     }
 }

@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/yukirawa/ai-office/server/internal/llm"
 	"github.com/yukirawa/ai-office/server/internal/persona"
@@ -44,19 +45,26 @@ const (
 // TODO(§11): モデル選定は未決定。設定（環境変数）から注入できるようにする。
 const DefaultModel = "claude-3-5-haiku-latest"
 
+// レビュー結果に応じた関係値（affinity/trust）の増減量。
+//
+// TODO(§11): 値は暫定。運用しながら調整する（成功で緩やかに上げ、失敗で強めに下げる）。
+const (
+	// 成功: mgr -> assignee。
+	relSuccessMgrToAssigneeAffinity = 2
+	relSuccessMgrToAssigneeTrust    = 1
+	// 成功: assignee -> mgr。
+	relSuccessAssigneeToMgrAffinity = 1
+	relSuccessAssigneeToMgrTrust    = 0
+	// 失敗: mgr -> assignee。
+	relFailureMgrToAssigneeAffinity = -3
+	relFailureMgrToAssigneeTrust    = -2
+)
+
 // planningInstruction は mgr の計画フェーズ用の追加システムプロンプト。
 const planningInstruction = "あなたは管理職です。タスクの実行計画を短く日本語で述べてください。実行はしないこと。"
 
 // continueInstruction は応答が終端でなかった場合に次のターンへ促す文言。
 const continueInstruction = "前回の計画を踏まえて更新してください。変化がなければ同じ内容を返して構いません。"
-
-// Task はエージェントに割り当てられた作業単位。
-type Task struct {
-	ID          string
-	Title       string
-	Description string
-	From        string
-}
 
 // Notifier は agent からチャンネル投稿・状態公開を行うための境界。
 // api パッケージを import すると循環参照になるため、インターフェースで分離する。
@@ -74,12 +82,13 @@ type Employee struct {
 	State   string // "idle", "thinking", "working" など
 }
 
-// Options は Manager の挙動を調整する。ゼロ値は既定値に正規化される。
+// Options は Manager / DevAgent の挙動を調整する。ゼロ値は既定値に正規化される。
 type Options struct {
-	MaxTurns    int          // 1 タスクあたりの最大ターン数。既定 8
-	TokenBudget int          // 1 タスクあたりの入出力合計トークン上限。既定 20000
-	Channel     string       // 報告先チャンネル。既定 "#会議室"
-	Logger      *slog.Logger // 既定 slog.Default()
+	MaxTurns    int           // 1 タスクあたりの最大ターン数。既定 8
+	TokenBudget int           // 1 タスクあたりの入出力合計トークン上限。既定 20000
+	Channel     string        // 報告先チャンネル。既定 "#会議室"
+	TaskTimeout time.Duration // worker の実行結果を待つ上限。既定 5 分
+	Logger      *slog.Logger  // 既定 slog.Default()
 }
 
 // Manager は 1 体の AI 社員を動かす。1 Manager = 1 goroutine を想定する。
@@ -89,6 +98,14 @@ type Manager struct {
 	opts     Options
 
 	employee Employee
+
+	// 割当先（dev）とタスク状態更新・関係値更新は構築後に差し替えられるため、
+	// 専用のミューテックスで保護する（§13.3 の状態遷移を mgr が駆動する）。
+	assignMu  sync.Mutex
+	assignees []*DevAgent
+	assignIdx int
+	updater   TaskUpdater
+	rel       RelationshipUpdater
 
 	mu    sync.RWMutex
 	state string
@@ -127,10 +144,73 @@ func normalizeOptions(opts Options) Options {
 	if strings.TrimSpace(opts.Channel) == "" {
 		opts.Channel = defaultChannel
 	}
+	if opts.TaskTimeout <= 0 {
+		opts.TaskTimeout = defaultTaskTimeout
+	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
 	return opts
+}
+
+// SetAssignees は dev エージェントの割当先を設定する。構築後でも呼べる。
+// 以降のタスクはラウンドロビンで均等に割り当てられる。
+func (m *Manager) SetAssignees(assignees ...*DevAgent) {
+	m.assignMu.Lock()
+	defer m.assignMu.Unlock()
+	m.assignees = append([]*DevAgent(nil), assignees...)
+	m.assignIdx = 0
+}
+
+// SetTaskUpdater はタスク状態を永続化する実装（api）を設定する。構築後でも呼べる。
+func (m *Manager) SetTaskUpdater(u TaskUpdater) {
+	m.assignMu.Lock()
+	defer m.assignMu.Unlock()
+	m.updater = u
+}
+
+// SetRelationships は関係値の更新実装（persona.Service）を設定する。構築後でも呼べる。
+func (m *Manager) SetRelationships(u RelationshipUpdater) {
+	m.assignMu.Lock()
+	defer m.assignMu.Unlock()
+	m.rel = u
+}
+
+// nextAssignee は次の割当先をラウンドロビンで返す。未設定なら nil。
+func (m *Manager) nextAssignee() *DevAgent {
+	m.assignMu.Lock()
+	defer m.assignMu.Unlock()
+	if len(m.assignees) == 0 {
+		return nil
+	}
+	a := m.assignees[m.assignIdx%len(m.assignees)]
+	m.assignIdx++
+	return a
+}
+
+// taskUpdater は現在の TaskUpdater を返す（未設定なら nil）。
+func (m *Manager) taskUpdater() TaskUpdater {
+	m.assignMu.Lock()
+	defer m.assignMu.Unlock()
+	return m.updater
+}
+
+// relationshipUpdater は現在の RelationshipUpdater を返す（未設定なら nil）。
+func (m *Manager) relationshipUpdater() RelationshipUpdater {
+	m.assignMu.Lock()
+	defer m.assignMu.Unlock()
+	return m.rel
+}
+
+// updateTask はタスク状態を更新する。エラーはログに記録するだけで握りつぶす。
+func (m *Manager) updateTask(ctx context.Context, taskID, status, result string) {
+	u := m.taskUpdater()
+	if u == nil {
+		return
+	}
+	if err := u.UpdateTask(ctx, taskID, status, result); err != nil {
+		m.logger().Error("タスク状態の更新に失敗しました", "task_id", taskID, "status", status, "error", err)
+	}
 }
 
 // Run は Inbox を処理し続ける。ctx.Done か Inbox のクローズまで終了しない。
@@ -291,7 +371,80 @@ func (m *Manager) handleTask(ctx context.Context, t Task) {
 		plan = "(計画を生成できませんでした)"
 	}
 	m.notify(ctx, reportPrefix(t)+plan)
+
+	// 計画を dev に割り当てる（§13.3: pending → assigned）。
+	m.assignTask(ctx, t, plan)
 	m.setState(StateIdle)
+}
+
+// assignTask は計画済みタスクを次の dev に割り当てる。
+func (m *Manager) assignTask(ctx context.Context, t Task, plan string) {
+	assignee := m.nextAssignee()
+	if assignee == nil {
+		m.notify(ctx, fmt.Sprintf("【%s】担当者が割り当てられていません。", taskLabel(t)))
+		m.updateTask(ctx, t.ID, "failed", "no assignee")
+		return
+	}
+
+	task := t
+	task.Plan = plan
+	task.Assignee = assignee.ID()
+	m.updateTask(ctx, t.ID, "assigned", plan)
+	if !assignee.Post(task) {
+		m.updateTask(ctx, t.ID, "failed", "assignee inbox full")
+		m.notify(ctx, fmt.Sprintf("【%s】担当者の受信箱が満杯のため割り当てできませんでした。", taskLabel(t)))
+		return
+	}
+	m.logger().Info("タスクを割り当てました", "task_id", t.ID, "assignee", assignee.ID())
+}
+
+// Review は dev の結果を承認し、タスクを done / failed へ遷移させる（§13.3）。
+// Reviewer インターフェースを実装する。
+func (m *Manager) Review(ctx context.Context, t Task, res Result) {
+	status := "failed"
+	label := "差し戻し"
+	success := strings.TrimSpace(res.Status) == "done"
+	if success {
+		status = "done"
+		label = "done"
+	}
+
+	// タスク状態を更新する前に、成功/失敗に応じて関係値を動かす（§8 4.2）。
+	// ここでの失敗はログに記録するだけで、レビュー自体は続行する。
+	m.adjustRelationships(ctx, t, success)
+
+	m.updateTask(ctx, t.ID, status, res.Summary)
+	m.notify(ctx, fmt.Sprintf("【レビュー】タスク「%s」を %s としました: %s", taskLabel(t), label, res.Summary))
+	m.logger().Info("タスクをレビューしました", "task_id", t.ID, "status", status)
+}
+
+// adjustRelationships は Review の結果に応じて mgr と担当者の関係値を更新する。
+// updater 未設定・担当者未設定の場合は何もしない。
+func (m *Manager) adjustRelationships(ctx context.Context, t Task, success bool) {
+	u := m.relationshipUpdater()
+	if u == nil {
+		return
+	}
+	assignee := strings.TrimSpace(t.Assignee)
+	if assignee == "" {
+		return
+	}
+	mgrID := m.employee.ID
+
+	if success {
+		m.adjustRelationship(ctx, u, t.ID, mgrID, assignee, relSuccessMgrToAssigneeAffinity, relSuccessMgrToAssigneeTrust)
+		m.adjustRelationship(ctx, u, t.ID, assignee, mgrID, relSuccessAssigneeToMgrAffinity, relSuccessAssigneeToMgrTrust)
+		return
+	}
+	m.adjustRelationship(ctx, u, t.ID, mgrID, assignee, relFailureMgrToAssigneeAffinity, relFailureMgrToAssigneeTrust)
+}
+
+// adjustRelationship は 1 方向の関係値を更新する。エラーはログのみで Review を止めない。
+func (m *Manager) adjustRelationship(ctx context.Context, u RelationshipUpdater, taskID, fromID, toID string, affinityDelta, trustDelta int) {
+	if err := u.Adjust(ctx, fromID, toID, affinityDelta, trustDelta); err != nil {
+		m.logger().Error("関係値の更新に失敗しました",
+			"task_id", taskID, "from", fromID, "to", toID, "error", err)
+	}
 }
 
 // systemPrompt はペルソナのシステムプロンプトに計画用の指示を足して返す。
@@ -348,8 +501,8 @@ func taskPrompt(t Task) string {
 	return b.String()
 }
 
-// reportPrefix は報告文の先頭に付けるタスク識別子を組み立てる。
-func reportPrefix(t Task) string {
+// taskLabel はタスクの表示名を返す（タイトルが無ければ ID で代替）。
+func taskLabel(t Task) string {
 	title := strings.TrimSpace(t.Title)
 	if title == "" {
 		title = t.ID
@@ -357,11 +510,16 @@ func reportPrefix(t Task) string {
 	if title == "" {
 		title = "(無題タスク)"
 	}
+	return title
+}
+
+// reportPrefix は報告文の先頭に付けるタスク識別子を組み立てる。
+func reportPrefix(t Task) string {
 	from := strings.TrimSpace(t.From)
 	if from == "" {
 		from = "不明"
 	}
-	return fmt.Sprintf("【%s / 依頼: %s】", title, from)
+	return fmt.Sprintf("【%s / 依頼: %s】", taskLabel(t), from)
 }
 
 // isTerminalStop は応答が「これ以上続ける必要がない」ことを示すか判定する。

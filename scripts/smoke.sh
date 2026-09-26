@@ -13,7 +13,9 @@ HTTP="http://127.0.0.1:${PORT}"
 OUT="${ROOT}/server/data/smoke"
 
 mkdir -p "${OUT}"
+rm -rf "${OUT}/ws"
 rm -f "${OUT}"/*.db "${OUT}"/*.db-* "${OUT}"/*.log
+mkdir -p "${OUT}/ws/dev_m" "${OUT}/ws/dev_f"
 
 echo "== build =="
 (cd "${ROOT}/server" && go build -o "${OUT}/officed" ./cmd/officed)
@@ -43,9 +45,11 @@ curl -fsS "${HTTP}/healthz"; echo
 
 echo "== start workers (dev_m, dev_f) =="
 OFFICE_SERVER_URL="${BASE}" OFFICE_EMPLOYEE_ID=dev_m OFFICE_DEVICE_ID=zenbook \
+  OFFICE_WORKSPACE="${OUT}/ws/dev_m" OFFICE_SANDBOX="none" \
   "${ROOT}/client/target/debug/worker" > "${OUT}/dev_m.log" 2>&1 &
 W1_PID=$!
 OFFICE_SERVER_URL="${BASE}" OFFICE_EMPLOYEE_ID=dev_f OFFICE_DEVICE_ID=zenbook \
+  OFFICE_WORKSPACE="${OUT}/ws/dev_f" OFFICE_SANDBOX="none" \
   "${ROOT}/client/target/debug/worker" > "${OUT}/dev_f.log" 2>&1 &
 W2_PID=$!
 sleep 2
@@ -56,11 +60,19 @@ curl -fsS "${HTTP}/api/employees"; echo
 echo "== TUI snapshot (タスク投入前) =="
 OFFICE_SERVER_URL="${BASE}" "${ROOT}/client/target/debug/tui" --snapshot
 
-echo "== POST /api/tasks (mgr に計画させる) =="
+echo "== POST /api/tasks (mgr -> dev に割当て、worker が実行) =="
 curl -fsS -X POST "${HTTP}/api/tasks" \
   -H 'Content-Type: application/json' \
-  -d '{"title":"TUI の受け入れ確認","description":"Phase 0/1 の疎通確認","from":"owner"}'; echo
-sleep 2
+  -d '{"title":"TUI の受け入れ確認","description":"Phase 0/1/2 の疎通確認","from":"owner"}'; echo
+sleep 3
+
+echo "== tasks (状態遷移: pending -> assigned -> working -> review -> done) =="
+curl -fsS "${HTTP}/api/tasks?limit=3"; echo
+
+echo "== worker が実際に書いたファイル（Phase 2.1 Local モード） =="
+find "${OUT}/ws" -type f | sort
+echo "-- report の中身 --"
+find "${OUT}/ws" -name '*.md' -exec cat {} \;
 
 echo "== TUI snapshot (タスク投入後) =="
 OFFICE_SERVER_URL="${BASE}" "${ROOT}/client/target/debug/tui" --snapshot

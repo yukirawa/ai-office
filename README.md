@@ -72,7 +72,8 @@ cd client
 ./target/debug/tui
 ```
 
-タスクを mgr に投入すると計画が `#会議室` に投稿される（Phase 1.3 の確認）:
+タスクを mgr に投入すると、mgr が計画 → dev エージェントが worker に割当 → worker が実行、
+という流れで処理される（Phase 1.3 / 2 の確認）:
 
 ```sh
 curl -X POST http://127.0.0.1:8787/api/tasks \
@@ -80,14 +81,59 @@ curl -X POST http://127.0.0.1:8787/api/tasks \
   -d '{"title":"ログイン画面の実装","description":"...","from":"owner"}'
 ```
 
+worker は Local モードで `OFFICE_WORKSPACE` の中にファイルを書き、結果を返す。
+状態遷移は `GET /api/tasks` で確認できる:
+
+```sh
+curl http://127.0.0.1:8787/api/tasks?limit=5
+# pending -> assigned -> working -> review -> done
+```
+
+## タスク実行の仕組み（Phase 2）
+
+```
+POST /api/tasks
+  -> mgr: LLM で計画を立て #会議室 に投稿
+  -> mgr: dev_m / dev_f にラウンドロビンで割当（tasks.status=assigned）
+  -> dev: 計画を JSON アクションに変換して task_assign を送信（status=working）
+  -> worker: OFFICE_WORKSPACE 内で実行（bubblewrap サンドボックス）
+  -> worker: task_result を返す（status=review）
+  -> mgr: レビューして done / failed
+```
+
+worker の実行モード:
+
+- **local**: `{"actions":[{"op":"read|write|list|exec",...}]}` をワークスペース内で実行。
+  パスはワークスペース外へ出られない（`..` や絶対パスは拒否）。`exec` は既定で無効。
+- **remote**: GitHub REST API でブランチ作成 → コミット → PR 作成。サーバーが発行した
+  短命の installation token を `task_assign` の payload で受け取る。worker がオフラインの
+  ときはサーバー側（`gh`）が PR を作る。
+
+## GitHub 連携（Phase 3・任意）
+
+GitHub App を用意して以下の環境変数を設定すると有効になる。未設定なら連携せず起動する。
+
+| 変数 | 説明 |
+| --- | --- |
+| `GITHUB_APP_ID` | GitHub App の ID |
+| `GITHUB_INSTALLATION_ID` | インストール ID |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | 秘密鍵 PEM（既定 `secrets/github-app.pem`。`GITHUB_PRIVATE_KEY` で直接渡してもよい） |
+| `GITHUB_WEBHOOK_SECRET` | webhook 署名検証用（HMAC-SHA256） |
+| `GITHUB_REPO` | 既定の対象リポジトリ `owner/name` |
+| `GITHUB_BASE_BRANCH` | PR のベースブランチ（既定 `main`） |
+
+App の権限は `repo`, `pull_requests`, `issues` のみ（§9）。webhook で `issues.opened` を受けると
+remote タスクに変換され、PR 作成まで進む。署名は `X-Hub-Signature-256` で検証する。
+
 ## 自動E2E
 
 ```sh
 sh scripts/smoke.sh
 ```
 
-`officed` 起動 → worker 2 体接続 → 出退勤・presence・タスク計画・日割り給与 cron を
-確認し、TUI のヘッドレススナップショット（`tui --snapshot`）を表示する。
+`officed` 起動 → worker 2 体接続 → 出退勤・presence・タスク計画→実行（Local モードで実際に
+ファイル作成）・日割り給与 cron を確認し、TUI のヘッドレススナップショット（`tui --snapshot`）
+を表示する。workspace は `server/data/smoke/ws/`。
 
 ## テスト
 
@@ -108,8 +154,19 @@ cd client && cargo test --workspace
 | `OFFICE_LLM_PROVIDER` | `mock` | `mock` または `anthropic` |
 | `OFFICE_LLM_MODEL` | `claude-3-5-haiku-latest` | モデル名 |
 | `ANTHROPIC_API_KEY` | （空） | 未設定なら `secrets/anthropic.key` を読む。無ければ mock |
+| `GITHUB_*` | （空） | 上記「GitHub 連携」を参照 |
 
 クライアント（worker / tui）は `OFFICE_SERVER_URL`（既定 `ws://127.0.0.1:8787/ws`）を使う。
+worker の追加設定:
+
+| 変数 | 既定 | 説明 |
+| --- | --- | --- |
+| `OFFICE_EMPLOYEE_ID` | （必須） | 社員 ID（`dev_m` / `dev_f` / `mgr`） |
+| `OFFICE_DEVICE_ID` | hostname | 端末名 |
+| `OFFICE_WORKSPACE` | （空） | local モードで読み書きする作業ディレクトリ |
+| `OFFICE_SANDBOX` | `bwrap` | `bwrap` または `none` |
+| `OFFICE_ALLOW_EXEC` | `0` | `1` で `exec` アクションを許可 |
+| `OFFICE_GITHUB_API_URL` | `https://api.github.com` | remote モードの API ベース |
 
 ## エンドポイント（§4.3）
 
@@ -120,11 +177,14 @@ cd client && cargo test --workspace
 | GET | `/api/employees` | 社員一覧 + 在席状態 |
 | GET | `/api/ledger/:id` | 学の残高 |
 | GET | `/api/relationships/:id` | 関係値 |
-| POST | `/api/tasks` | オーナーからのタスク投入（mgr に計画させる） |
-| POST | `/webhook/github` | GitHub webhook（Phase 3、現在 501） |
+| POST | `/api/tasks` | オーナーからのタスク投入（`title`/`description`/`from`/`mode`/`repo`/`base_branch`） |
+| GET | `/api/tasks` | タスク一覧（`?status=&limit=`） |
+| POST | `/webhook/github` | GitHub webhook（署名検証 → タスク化） |
 
 ## 現在のフェーズ
 
 - **Phase 0（完了）**: protocol crate / presence + WS / worker 接続ループ / TUI read-only
-- **Phase 1（完了）**: SQLite store / LLM HTTP ラッパー（Anthropic + mock）/ mgr エージェント（計画のみ）/ 日割り給与 cron
-- 次は Phase 2（手足: Local モード, `task_assign`, bubblewrap, `dev_m` エージェント）
+- **Phase 1（完了）**: SQLite store / LLM HTTP ラッパー（Anthropic + mock）/ mgr エージェント（計画）/ 日割り給与 cron
+- **Phase 2（完了）**: `task_assign`/`task_result` / worker Local モード（ファイル操作）/ bubblewrap サンドボックス / dev_m・dev_f エージェント（mgr がラウンドロビン割当 → レビュー）
+- **Phase 3（実装済み・要資格情報）**: GitHub App 認証（JWT → installation token）/ worker Remote モード（ブランチ → コミット → PR）/ webhook 署名検証 → タスク化 / worker 不在時のサーバー側 PR 作成
+- 次は Phase 4（ペルソナ・関係値・`chat` 役の Ollama 連携・雑談 cron）

@@ -19,6 +19,8 @@ import (
 
 	"github.com/google/uuid"
 	"nhooyr.io/websocket"
+
+	"github.com/yukirawa/ai-office/server/internal/agents"
 )
 
 const (
@@ -100,6 +102,34 @@ func (h *hub) broadcast(v any) {
 	}
 }
 
+// byEmployee は指定社員として接続中のクライアントを返す（observer は対象外）。
+func (h *hub) byEmployee(employeeID string) *client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for c := range h.clients {
+		if c.known && c.employeeID == employeeID {
+			return c
+		}
+	}
+	return nil
+}
+
+// sendJSONTo は 1 クライアントへ直接メッセージを送る。バッファ満杯なら false。
+func (h *hub) sendJSONTo(c *client, v any) bool {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	select {
+	case c.send <- b:
+		return true
+	default:
+		return false
+	}
+}
+
 // handleWS は /ws のハンドラ。
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -154,6 +184,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	close(cl.send)
 
 	if info.known {
+		s.failWaiters(cl.employeeID, reason)
 		s.checkOut(ctx, cl.employeeID, info.name, reason)
 	}
 	_ = conn.Close(websocket.StatusNormalClosure, "")
@@ -292,6 +323,27 @@ func (s *Server) readLoop(ctx context.Context, cl *client) string {
 			_ = json.Unmarshal(data, &b)
 			s.log.Info("bye を受信しました", "employee_id", cl.employeeID, "reason", b.Reason)
 			return "bye"
+		case "task_result":
+			var res taskResultMsg
+			if err := json.Unmarshal(data, &res); err != nil {
+				s.log.Warn("task_result の解釈に失敗しました", "employee_id", cl.employeeID, "error", err)
+				continue
+			}
+			s.log.Info("task_result を受信しました",
+				"task_id", res.TaskID, "status", res.Status, "employee_id", cl.employeeID)
+			s.deliverResult(agents.Result{
+				TaskID:  res.TaskID,
+				Status:  res.Status,
+				Summary: res.Summary,
+				Detail:  res.Detail,
+			})
+		case "task_progress":
+			var pg taskProgressMsg
+			if err := json.Unmarshal(data, &pg); err != nil {
+				continue
+			}
+			s.log.Info("task_progress を受信しました",
+				"task_id", pg.TaskID, "percent", pg.Percent, "message", pg.Message)
 		case "hello":
 			s.sendError(cl, "duplicate_hello", "hello は接続時に 1 回だけ送ってください")
 		default:

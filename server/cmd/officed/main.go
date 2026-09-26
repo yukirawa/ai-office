@@ -22,6 +22,7 @@ import (
 	"github.com/yukirawa/ai-office/server/internal/api"
 	"github.com/yukirawa/ai-office/server/internal/config"
 	"github.com/yukirawa/ai-office/server/internal/economy"
+	"github.com/yukirawa/ai-office/server/internal/gh"
 	"github.com/yukirawa/ai-office/server/internal/llm"
 	"github.com/yukirawa/ai-office/server/internal/persona"
 	"github.com/yukirawa/ai-office/server/internal/presence"
@@ -85,14 +86,45 @@ func run() error {
 		loadPersona(st, config.EmployeeManagerID, logger),
 		client,
 		srv,
-		agents.Options{
-			MaxTurns:    cfg.MaxAgentTurns,
-			TokenBudget: cfg.TokenBudget,
-			Channel:     "#会議室",
-			Logger:      logger,
-		},
+		agentOptions(cfg, logger),
 	)
+
+	// ---- 手足の操作（Phase 2: dev エージェント） ----
+	// dev エージェントはサーバー側の頭脳で、実際のファイル操作や GitHub 操作は
+	// worker（Zenbook）に task_assign して実行させる。
+	devM := agents.NewDevAgent(
+		config.EmployeeDevMID, loadPersona(st, config.EmployeeDevMID, logger),
+		client, srv, srv, srv, srv, mgr, agentOptions(cfg, logger),
+	)
+	devF := agents.NewDevAgent(
+		config.EmployeeDevFID, loadPersona(st, config.EmployeeDevFID, logger),
+		client, srv, srv, srv, srv, mgr, agentOptions(cfg, logger),
+	)
+	mgr.SetAssignees(devM, devF)
+	mgr.SetTaskUpdater(srv)
 	srv.SetManager(mgr)
+
+	// ---- GitHub 連携（Phase 3） ----
+	// 設定が揃っているときだけ有効化する。worker 不在時はサーバーが PR を作る。
+	if cfg.GitHubEnabled() {
+		ghClient, err := gh.New(gh.Config{
+			AppID:          cfg.GitHubAppID,
+			InstallationID: cfg.GitHubInstallationID,
+			PrivateKeyPEM:  cfg.GitHubPrivateKeyPEM,
+		})
+		if err != nil {
+			logger.Error("GitHub 連携を初期化できませんでした", "error", err)
+		} else {
+			srv.SetGitHub(ghClient)
+			logger.Info("GitHub 連携を有効化しました",
+				"app_id", cfg.GitHubAppID,
+				"installation_id", cfg.GitHubInstallationID,
+				"repo", cfg.GitHubRepo,
+			)
+		}
+	} else {
+		logger.Info("GitHub 連携は無効です（GITHUB_APP_ID / GITHUB_INSTALLATION_ID / 秘密鍵が未設定）")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -100,6 +132,8 @@ func run() error {
 	// ---- バックグラウンド処理 ----
 	go srv.RunReaper(ctx)
 	go mgr.Run(ctx)
+	go devM.Run(ctx)
+	go devF.Run(ctx)
 
 	// ---- 日割り給与 cron（Phase 1.4） ----
 	cronScheduler := startPayrollCron(ctx, cfg, st, econ, srv, logger)
@@ -172,6 +206,16 @@ func buildLLM(cfg *config.Config, logger *slog.Logger) llm.Client {
 	default:
 		logger.Info("LLM プロバイダ: mock（外部 API を呼びません）")
 		return mockLLM()
+	}
+}
+
+// agentOptions は mgr / dev 共通の Options を設定から組み立てる。
+func agentOptions(cfg *config.Config, logger *slog.Logger) agents.Options {
+	return agents.Options{
+		MaxTurns:    cfg.MaxAgentTurns,
+		TokenBudget: cfg.TokenBudget,
+		Channel:     "#会議室",
+		Logger:      logger,
 	}
 }
 

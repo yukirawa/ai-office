@@ -9,6 +9,8 @@ import (
 
 // Task は tasks テーブルの 1 行（設計書 §5）。
 // Status は pending|assigned|working|review|done|failed。
+// Mode は "local"（ワーカーのファイル操作）|"remote"（GitHub API）。
+// Repo / BaseBranch は remote モードで使う（Phase 3）。
 type Task struct {
 	ID          string
 	Title       string
@@ -17,11 +19,14 @@ type Task struct {
 	Assignee    string
 	CreatedBy   string
 	Result      string
+	Mode        string
+	Repo        string
+	BaseBranch  string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
 
-const taskColumns = `id, title, description, status, assignee, created_by, result, created_at, updated_at`
+const taskColumns = `id, title, description, status, assignee, created_by, result, mode, repo, base_branch, created_at, updated_at`
 
 // InsertTask はタスクを追加する。CreatedAt / UpdatedAt がゼロ値なら現在時刻。
 func (s *Store) InsertTask(t Task) error {
@@ -35,9 +40,13 @@ func (s *Store) InsertTask(t Task) error {
 	if t.UpdatedAt.IsZero() {
 		t.UpdatedAt = t.CreatedAt
 	}
+	if t.Mode == "" {
+		t.Mode = "local"
+	}
 	if _, err := s.db.Exec(
-		`INSERT INTO tasks (`+taskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (`+taskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.Title, t.Description, t.Status, t.Assignee, t.CreatedBy, t.Result,
+		t.Mode, t.Repo, t.BaseBranch,
 		formatTime(t.CreatedAt), formatTime(t.UpdatedAt),
 	); err != nil {
 		return fmt.Errorf("store: insert task %s: %w", t.ID, err)
@@ -117,7 +126,7 @@ func scanTask(sc scanner) (Task, error) {
 		created, updated string
 	)
 	if err := sc.Scan(&t.ID, &t.Title, &t.Description, &t.Status, &t.Assignee,
-		&t.CreatedBy, &t.Result, &created, &updated); err != nil {
+		&t.CreatedBy, &t.Result, &t.Mode, &t.Repo, &t.BaseBranch, &created, &updated); err != nil {
 		return Task{}, err
 	}
 	t.CreatedAt = parseTime(created)

@@ -75,6 +75,23 @@ type Config struct {
 	TokenBudget int
 	// LogLevel は slog のレベル名（env OFFICE_LOG_LEVEL）。
 	LogLevel string
+
+	// ---- Phase 3: GitHub ----
+
+	// GitHubAppID は GitHub App の ID（env GITHUB_APP_ID）。0 なら GitHub 連携は無効。
+	GitHubAppID int64
+	// GitHubInstallationID はインストール ID（env GITHUB_INSTALLATION_ID）。
+	GitHubInstallationID int64
+	// GitHubPrivateKeyPath は App の秘密鍵 PEM のパス（env GITHUB_APP_PRIVATE_KEY_PATH）。
+	GitHubPrivateKeyPath string
+	// GitHubPrivateKeyPEM は秘密鍵の内容（env GITHUB_PRIVATE_KEY があれば優先、無ければパスから読む）。
+	GitHubPrivateKeyPEM string
+	// GitHubWebhookSecret は webhook 署名検証用の secret（env GITHUB_WEBHOOK_SECRET）。
+	GitHubWebhookSecret string
+	// GitHubRepo は対象リポジトリ（env GITHUB_REPO、"owner/name"）。
+	GitHubRepo string
+	// GitHubBaseBranch は PR のベースブランチ（env GITHUB_BASE_BRANCH）。
+	GitHubBaseBranch string
 }
 
 // Load は環境変数から Config を読み込む。
@@ -92,6 +109,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	ghAppID, err := int64Env("GITHUB_APP_ID", 0)
+	if err != nil {
+		return nil, err
+	}
+	ghInstallationID, err := int64Env("GITHUB_INSTALLATION_ID", 0)
+	if err != nil {
+		return nil, err
+	}
 
 	apiKey := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY"))
 	if apiKey == "" {
@@ -100,20 +125,38 @@ func Load() (*Config, error) {
 		apiKey = readSecretFile("anthropic.key")
 	}
 
+	ghKeyPath := stringEnv("GITHUB_APP_PRIVATE_KEY_PATH", filepath.Join("secrets", "github-app.pem"))
+	ghPEM := strings.TrimSpace(os.Getenv("GITHUB_PRIVATE_KEY"))
+	if ghPEM == "" {
+		ghPEM = readSecretPath(ghKeyPath)
+	}
+
 	return &Config{
-		Addr:             stringEnv("OFFICE_ADDR", defaultAddr),
-		DBPath:           stringEnv("OFFICE_DB", defaultDBPath),
-		HeartbeatTimeout: heartbeat,
-		PayrollCron:      stringEnv("OFFICE_PAYROLL_CRON", defaultPayrollCron),
-		PayrollTimezone:  stringEnv("OFFICE_PAYROLL_TZ", defaultPayrollTimezone),
-		LLMProvider:      stringEnv("OFFICE_LLM_PROVIDER", defaultLLMProvider),
-		LLMModel:         stringEnv("OFFICE_LLM_MODEL", defaultLLMModel),
-		AnthropicAPIKey:  apiKey,
-		AnthropicBaseURL: stringEnv("OFFICE_ANTHROPIC_BASE_URL", defaultAnthropicBaseURL),
-		MaxAgentTurns:    maxTurns,
-		TokenBudget:      tokenBudget,
-		LogLevel:         stringEnv("OFFICE_LOG_LEVEL", defaultLogLevel),
+		Addr:                 stringEnv("OFFICE_ADDR", defaultAddr),
+		DBPath:               stringEnv("OFFICE_DB", defaultDBPath),
+		HeartbeatTimeout:     heartbeat,
+		PayrollCron:          stringEnv("OFFICE_PAYROLL_CRON", defaultPayrollCron),
+		PayrollTimezone:      stringEnv("OFFICE_PAYROLL_TZ", defaultPayrollTimezone),
+		LLMProvider:          stringEnv("OFFICE_LLM_PROVIDER", defaultLLMProvider),
+		LLMModel:             stringEnv("OFFICE_LLM_MODEL", defaultLLMModel),
+		AnthropicAPIKey:      apiKey,
+		AnthropicBaseURL:     stringEnv("OFFICE_ANTHROPIC_BASE_URL", defaultAnthropicBaseURL),
+		MaxAgentTurns:        maxTurns,
+		TokenBudget:          tokenBudget,
+		LogLevel:             stringEnv("OFFICE_LOG_LEVEL", defaultLogLevel),
+		GitHubAppID:          ghAppID,
+		GitHubInstallationID: ghInstallationID,
+		GitHubPrivateKeyPath: ghKeyPath,
+		GitHubPrivateKeyPEM:  ghPEM,
+		GitHubWebhookSecret:  os.Getenv("GITHUB_WEBHOOK_SECRET"),
+		GitHubRepo:           strings.TrimSpace(os.Getenv("GITHUB_REPO")),
+		GitHubBaseBranch:     stringEnv("GITHUB_BASE_BRANCH", "main"),
 	}, nil
+}
+
+// GitHubEnabled は GitHub App 連携に必要な設定が揃っているかを返す。
+func (c *Config) GitHubEnabled() bool {
+	return c.GitHubAppID > 0 && c.GitHubInstallationID > 0 && strings.TrimSpace(c.GitHubPrivateKeyPEM) != ""
 }
 
 // stringEnv は環境変数を読み、空文字なら既定値を返す。
@@ -131,6 +174,19 @@ func intEnv(key string, def int) (int, error) {
 		return def, nil
 	}
 	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s は整数ではありません: %q: %w", key, v, err)
+	}
+	return n, nil
+}
+
+// int64Env は 64bit 整数の環境変数を読む。空文字・未設定なら既定値。
+func int64Env(key string, def int64) (int64, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("config: %s は整数ではありません: %q: %w", key, v, err)
 	}
@@ -170,6 +226,18 @@ func readSecretFile(name string) string {
 		}
 	}
 	return ""
+}
+
+// readSecretPath は指定パスのファイルを読み、前後の空白を除いた内容を返す。
+// 見つからない場合は secrets/<basename> も探す。
+// どちらも無ければ空文字を返す（エラーにはしない）。
+func readSecretPath(path string) string {
+	if data, err := os.ReadFile(path); err == nil {
+		if v := strings.TrimSpace(string(data)); v != "" {
+			return v
+		}
+	}
+	return readSecretFile(filepath.Base(path))
 }
 
 // EmployeeSeed は初期社員の定義。store.SeedEmployees に渡して upsert する。

@@ -19,7 +19,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, EmployeeInfo, RelationshipInfo, ServerMsg};
+use protocol::{ClientMsg, EmployeeInfo, RelationshipInfo, ServerMsg, TaskInfo};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -30,6 +30,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const DEFAULT_URL: &str = "ws://127.0.0.1:8787/ws";
 const DEFAULT_TUI_ID: &str = "owner";
@@ -38,6 +39,8 @@ const BACKOFF_BASE_SECS: u64 = 1;
 const BACKOFF_MAX_SECS: u64 = 30;
 /// 保持する notice の最大件数（無限成長を防ぐ）。
 const MAX_NOTICES: usize = 500;
+/// タスクペインに表示する最大件数。
+const MAX_TASK_ROWS: usize = 8;
 /// スナップショットモードの収集秒数。
 const SNAPSHOT_SECS: u64 = 2;
 /// フレーム更新間隔（約10fps）。
@@ -112,6 +115,8 @@ struct App {
     employees: Vec<EmployeeInfo>,
     ledger: BTreeMap<String, i64>,
     relationships: Vec<RelationshipInfo>,
+    /// 最新の office_state が持つタスク一覧（新しい順。追記ではなく置換）。
+    tasks: Vec<TaskInfo>,
     notices: Vec<NoticeLine>,
     status: ConnectionStatus,
 }
@@ -123,6 +128,7 @@ impl Default for App {
             employees: Vec::new(),
             ledger: BTreeMap::new(),
             relationships: Vec::new(),
+            tasks: Vec::new(),
             notices: Vec::new(),
             status: ConnectionStatus::Connecting,
         }
@@ -158,14 +164,20 @@ impl App {
                 employees,
                 ledger,
                 relationships,
+                tasks,
                 ..
             } => {
                 self.online = online.clone();
                 self.employees = employees.clone();
                 self.ledger = ledger.clone();
                 self.relationships = relationships.clone();
+                // スナップショットは最新状態なので、追記せず置換する。
+                self.tasks = tasks.clone();
             }
-            ServerMsg::TaskAssign { .. } | ServerMsg::Error { .. } | ServerMsg::Unknown => {}
+            ServerMsg::TaskAssign { .. }
+            | ServerMsg::TaskCancel { .. }
+            | ServerMsg::Error { .. }
+            | ServerMsg::Unknown => {}
         }
     }
 
@@ -322,6 +334,20 @@ fn print_summary(cfg: &Config, app: &App) {
         println!("relationships from mgr:");
         for r in rels {
             println!("  - {} {:+}", r.to_id, r.affinity);
+        }
+    }
+
+    // tasks は新しい順なので先頭から最大5件を「last」として出す。
+    let tasks: Vec<&TaskInfo> = app.tasks.iter().take(5).collect();
+    println!("tasks (last {}):", tasks.len());
+    if tasks.is_empty() {
+        println!("  (なし)");
+    } else {
+        for t in tasks {
+            println!(
+                "  - status={} assignee={} mode={} title={}",
+                t.status, t.assignee, t.mode, t.title
+            );
         }
     }
 
@@ -503,7 +529,12 @@ fn draw(frame: &mut Frame, app: &App) {
     ])
     .split(chunks[0]);
 
-    draw_employees(frame, panes[0], app);
+    // 左列だけを上下に分割する（社員 60% / タスク 40%）。全3列の幅は変えない。
+    let left =
+        Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).split(panes[0]);
+
+    draw_employees(frame, left[0], app);
+    draw_tasks(frame, left[1], app);
     draw_notices(frame, panes[1], app);
     draw_mgr(frame, panes[2], app);
     draw_input(frame, chunks[1], app);
@@ -530,6 +561,39 @@ fn draw_employees(frame: &mut Frame, area: Rect, app: &App) {
 
     let list = List::new(items).block(Block::bordered().title("社員"));
     frame.render_widget(list, area);
+}
+
+fn draw_tasks(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::bordered().title("タスク");
+    let inner = block.inner(area);
+    // 枠線の内側の幅（プレフィックス分を差し引いておく）。
+    let max_chars = (inner.width as usize).saturating_sub(1);
+
+    let items: Vec<ListItem> = if app.tasks.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "(なし)",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        app.tasks
+            .iter()
+            .take(MAX_TASK_ROWS)
+            .map(|t| {
+                let (prefix, color) = task_status_prefix(&t.status);
+                let label = if t.status.is_empty() {
+                    "不明"
+                } else {
+                    t.status.as_str()
+                };
+                // 例: "✔done レポート作成 (dev_m)"。ペイン幅に収まるよう切り詰める。
+                let text = format!("{prefix}{label} {} ({})", t.title, t.assignee);
+                let text = truncate_to_width(&text, max_chars);
+                ListItem::new(Line::from(Span::styled(text, Style::default().fg(color))))
+            })
+            .collect()
+    };
+
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 fn draw_notices(frame: &mut Frame, area: Rect, app: &App) {
@@ -630,6 +694,42 @@ fn status_display(status: &str) -> (&'static str, String, Color) {
     }
 }
 
+/// タスクの status から（プレフィックス, 色）を返す（§13.3 の状態遷移を想定）。
+fn task_status_prefix(status: &str) -> (&'static str, Color) {
+    match status {
+        "done" => ("✔", Color::Green),
+        "working" => ("▶", Color::Yellow),
+        "review" => ("◀", Color::Cyan),
+        "assigned" => ("○", Color::Blue),
+        "pending" => ("·", Color::DarkGray),
+        "failed" => ("✗", Color::Red),
+        _ => ("·", Color::DarkGray),
+    }
+}
+
+/// タスク行をペインの表示幅に合わせて切り詰める。切ったときは末尾に `…` を付ける。
+fn truncate_to_width(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let limit = max - 1; // `…` の分を確保する。
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > limit {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
 fn text_of(msg: &Message) -> Option<&str> {
     match msg {
         Message::Text(text) => Some(text.as_str()),
@@ -655,10 +755,24 @@ fn env_string(key: &str, default: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, ConnectionStatus, backoff_delay, status_display};
-    use protocol::{EmployeeInfo, ServerMsg};
+    use super::{
+        App, ConnectionStatus, backoff_delay, status_display, task_status_prefix, truncate_to_width,
+    };
+    use protocol::{EmployeeInfo, ServerMsg, TaskInfo};
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    /// テスト用のタスクを組み立てる。
+    fn task(id: &str, title: &str, status: &str, assignee: &str) -> TaskInfo {
+        TaskInfo {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: status.to_string(),
+            assignee: assignee.to_string(),
+            mode: "local".to_string(),
+            result: String::new(),
+        }
+    }
 
     #[test]
     fn backoff_is_exponential_with_cap() {
@@ -694,12 +808,79 @@ mod tests {
             }],
             ledger: BTreeMap::from([("mgr".to_string(), 512i64)]),
             relationships: vec![],
+            tasks: vec![task("t1", "レポート作成", "working", "dev_m")],
             ts: "t".to_string(),
         };
         app.apply(&msg);
         assert_eq!(app.online, vec!["mgr"]);
         assert_eq!(app.ledger.get("mgr"), Some(&512));
         assert_eq!(app.mgr_state(), Some("idle"));
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].id, "t1");
+    }
+
+    #[test]
+    fn apply_office_state_replaces_tasks_not_appends() {
+        let mut app = App::default();
+        app.apply(&ServerMsg::OfficeState {
+            online: vec![],
+            employees: vec![],
+            ledger: BTreeMap::new(),
+            relationships: vec![],
+            tasks: vec![task("a", "A", "working", "dev_m")],
+            ts: "t1".to_string(),
+        });
+        assert_eq!(app.tasks.len(), 1);
+
+        // 次のスナップショットは追記ではなく置換（新しいスナップショットが正）。
+        app.apply(&ServerMsg::OfficeState {
+            online: vec![],
+            employees: vec![],
+            ledger: BTreeMap::new(),
+            relationships: vec![],
+            tasks: vec![
+                task("b", "B", "done", "dev_m"),
+                task("c", "C", "pending", "dev_f"),
+            ],
+            ts: "t2".to_string(),
+        });
+        assert_eq!(app.tasks.len(), 2);
+        assert_eq!(app.tasks[0].id, "b");
+        assert_eq!(app.tasks[1].id, "c");
+
+        // 空のスナップショットでクリアされる。
+        app.apply(&ServerMsg::OfficeState {
+            online: vec![],
+            employees: vec![],
+            ledger: BTreeMap::new(),
+            relationships: vec![],
+            tasks: vec![],
+            ts: "t3".to_string(),
+        });
+        assert!(app.tasks.is_empty());
+    }
+
+    #[test]
+    fn task_status_prefixes_match_spec() {
+        assert_eq!(task_status_prefix("done").0, "✔");
+        assert_eq!(task_status_prefix("working").0, "▶");
+        assert_eq!(task_status_prefix("review").0, "◀");
+        assert_eq!(task_status_prefix("assigned").0, "○");
+        assert_eq!(task_status_prefix("pending").0, "·");
+        assert_eq!(task_status_prefix("failed").0, "✗");
+        assert_eq!(task_status_prefix("weird").0, "·");
+    }
+
+    #[test]
+    fn truncate_to_width_respects_display_width() {
+        assert_eq!(truncate_to_width("abcdef", 6), "abcdef");
+        assert_eq!(truncate_to_width("abcdef", 10), "abcdef");
+        assert_eq!(truncate_to_width("abcdef", 4), "abc…");
+        assert_eq!(truncate_to_width("abcdef", 0), "");
+        // 全角は幅2として数える。"レポート" は幅 8。
+        assert_eq!(truncate_to_width("レポート", 8), "レポート");
+        assert_eq!(truncate_to_width("レポート", 6), "レポ…");
+        assert_eq!(truncate_to_width("レポート", 1), "…");
     }
 
     #[test]
@@ -755,6 +936,10 @@ mod tests {
                 affinity: 15,
                 trust: 70,
             }],
+            tasks: vec![
+                task("t1", "レポート", "done", "dev_m"),
+                task("t2", "調査", "working", "dev_f"),
+            ],
             ts: "t".to_string(),
         });
         app.apply(&ServerMsg::Notice {
@@ -765,7 +950,7 @@ mod tests {
         });
         app.status = ConnectionStatus::Connected;
 
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|frame| super::draw(frame, &app)).unwrap();
 
         let buf = terminal.backend().buffer();
@@ -779,6 +964,9 @@ mod tests {
         // 全角文字は TestBackend 上で幅2のセル + 埋め草になるため、空白を除いて照合する。
         let compact: String = view.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(compact.contains("社員"), "{view}");
+        assert!(compact.contains("タスク"), "{view}");
+        assert!(compact.contains("✔doneレポート(dev_m)"), "{view}");
+        assert!(compact.contains("▶working調査(dev_f)"), "{view}");
         assert!(compact.contains("#会議室"), "{view}");
         assert!(compact.contains("マネージャー在席"), "{view}");
         assert!(compact.contains("デブエフ退勤"), "{view}");

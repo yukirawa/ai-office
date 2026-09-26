@@ -72,6 +72,15 @@ var migrations = [][]string{
 		`CREATE INDEX IF NOT EXISTS idx_ledger_employee_id ON ledger (employee_id, id)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_status_created ON tasks (status, created_at)`,
 	},
+	// v2: Phase 2/3 のタスク実行に必要な列を追加（設計書 §5「カラム追加はOK」）。
+	// mode: "local"（ファイル操作）|"remote"（GitHub API）。
+	// repo/base_branch: remote モードで使う。
+	// ALTER TABLE は冪等にできないが、schema_version により 1 回しか実行されない。
+	{
+		`ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL DEFAULT 'local'`,
+		`ALTER TABLE tasks ADD COLUMN repo TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE tasks ADD COLUMN base_branch TEXT NOT NULL DEFAULT ''`,
+	},
 }
 
 // migrate は未適用のマイグレーションを順に流す。

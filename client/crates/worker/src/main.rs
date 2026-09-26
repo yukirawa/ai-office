@@ -1,7 +1,8 @@
-//! ai-office worker（Phase 0.3）。
+//! ai-office worker（Phase 0.3 + Phase 2/3）。
 //!
 //! サーバーへアウトバウンド WebSocket 接続し、`hello` → `welcome`、定期 `heartbeat`、
-//! 終了時 `bye` を送る常駐プロセス。Phase 0 では受信メッセージはログ出力のみ。
+//! 終了時 `bye` を送る常駐プロセス。`task_assign` を受信したら Local / Remote モードで
+//! 実行し、`task_result`（必要なら `task_progress`）を返す。
 //!
 //! 環境変数:
 //! - `OFFICE_SERVER_URL`    既定 `ws://127.0.0.1:8787/ws`
@@ -10,15 +11,27 @@
 //! - `OFFICE_HEARTBEAT_SECS` 既定 30
 //! - `OFFICE_MAX_RETRIES`   既定 0（0 は無限リトライ）
 //! - `OFFICE_VERSION`       既定 `0.1.0`
+//! - `OFFICE_WORKSPACE`     local モードの作業ディレクトリ（local では必須）
+//! - `OFFICE_SANDBOX`       `bwrap`（既定） | `none`
+//! - `OFFICE_ALLOW_EXEC`    `1` のときだけ `exec` を許可
+//! - `OFFICE_GITHUB_API_URL` 既定 `https://api.github.com`
 
+mod local;
+mod remote;
+mod sandbox;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMsg, ServerMsg};
+use protocol::{Artifact, ClientMsg, ServerMsg, TaskAssignPayload};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -30,9 +43,19 @@ const BACKOFF_BASE_SECS: u64 = 1;
 const BACKOFF_MAX_SECS: u64 = 30;
 /// `welcome` を待つ上限。サーバーが沈黙したままハングしないための保険。
 const WELCOME_TIMEOUT_SECS: u64 = 15;
+/// 送信チャネルの容量（heartbeat / task_result / task_progress をここに積む）。
+const OUTBOX_CAPACITY: usize = 64;
+/// 終了時にライタータスクを待つ上限。
+const WRITER_DRAIN_SECS: u64 = 5;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
+/// 送信メッセージ（JSON テキスト）。ライタータスクが WebSocket へ流す。
+type Outbox = mpsc::Sender<String>;
+/// タスクの協調キャンセルフラグ。
+type CancelFlag = Arc<AtomicBool>;
+/// 実行中タスクの task_id -> キャンセルフラグ。
+type Registry = Arc<Mutex<HashMap<String, CancelFlag>>>;
 
 /// 実行時設定。
 #[derive(Debug, Clone)]
@@ -43,6 +66,14 @@ struct Config {
     heartbeat_secs: u64,
     max_retries: u64,
     version: String,
+    /// local モードの作業ディレクトリ。
+    workspace: Option<PathBuf>,
+    /// `OFFICE_ALLOW_EXEC=1` のときだけ true。
+    allow_exec: bool,
+    /// `OFFICE_SANDBOX` の生値（解釈は local 実行時）。
+    sandbox_raw: String,
+    /// GitHub API のベース URL。
+    github_api_url: String,
 }
 
 impl Config {
@@ -66,6 +97,10 @@ impl Config {
             heartbeat_secs: env_u64("OFFICE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS).max(1),
             max_retries: env_u64("OFFICE_MAX_RETRIES", 0),
             version: env_string("OFFICE_VERSION", DEFAULT_VERSION),
+            workspace: env_opt_path("OFFICE_WORKSPACE"),
+            allow_exec: env_flag("OFFICE_ALLOW_EXEC"),
+            sandbox_raw: std::env::var("OFFICE_SANDBOX").unwrap_or_default(),
+            github_api_url: env_string("OFFICE_GITHUB_API_URL", remote::DEFAULT_API_BASE),
         })
     }
 }
@@ -91,6 +126,20 @@ async fn main() -> Result<()> {
     log(format!(
         "worker starting: employee_id={} device_id={} version={} url={} heartbeat={}s max_retries={}",
         cfg.employee_id, cfg.device_id, cfg.version, cfg.url, cfg.heartbeat_secs, cfg.max_retries
+    ));
+    log(format!(
+        "task config: workspace={} allow_exec={} sandbox={} github_api={}",
+        cfg.workspace
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unset)".to_string()),
+        cfg.allow_exec,
+        if cfg.sandbox_raw.trim().is_empty() {
+            "bwrap"
+        } else {
+            cfg.sandbox_raw.trim()
+        },
+        cfg.github_api_url,
     ));
 
     // SIGINT / SIGTERM を watch チャネルに流す。
@@ -227,6 +276,20 @@ async fn connect_and_run(cfg: &Config, shutdown: &mut watch::Receiver<bool>) -> 
         }
     }
 
+    // 送信はライタータスクへ集約する。heartbeat / task_result / task_progress は
+    // すべて outbox 経由になり、読み取りループを塞がない。
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOX_CAPACITY);
+    let mut writer = tokio::spawn(async move {
+        while let Some(text) = out_rx.recv().await {
+            if sink.send(Message::text(text)).await.is_err() {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+    });
+
+    let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+
     // heartbeat 用タイマー。interval の初回 tick は即時完了するので消費しておく。
     let mut heartbeat = interval(Duration::from_secs(cfg.heartbeat_secs));
     heartbeat.tick().await;
@@ -236,27 +299,36 @@ async fn connect_and_run(cfg: &Config, shutdown: &mut watch::Receiver<bool>) -> 
             res = shutdown.changed() => {
                 // 送信側が消えた場合も終了扱いにする。
                 if res.is_err() || *shutdown.borrow() {
-                    let _ = send_bye(&mut sink).await;
-                    let _ = sink.close().await;
+                    let bye = ClientMsg::Bye { reason: "shutdown".to_string() };
+                    let _ = out_tx.send(bye.to_json()).await;
+                    drop(out_tx);
+                    let _ = timeout(Duration::from_secs(WRITER_DRAIN_SECS), &mut writer).await;
                     log("closing connection");
                     return Ok(SessionEnd::Shutdown);
                 }
             }
             _ = heartbeat.tick() => {
                 let hb = ClientMsg::Heartbeat { ts: now_rfc3339() };
-                if let Err(err) = sink.send(Message::text(hb.to_json())).await {
+                if out_tx.send(hb.to_json()).await.is_err() {
                     return Ok(SessionEnd::Disconnected {
-                        reason: format!("heartbeat send failed: {err}"),
+                        reason: "outbox closed".to_string(),
                     });
                 }
                 log("sent heartbeat");
+            }
+            res = &mut writer => {
+                let reason = match res {
+                    Ok(()) => "writer task ended".to_string(),
+                    Err(err) => format!("writer task failed: {err}"),
+                };
+                return Ok(SessionEnd::Disconnected { reason });
             }
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(msg)) => {
                         if let Some(text) = text_of(&msg) {
                             match ServerMsg::parse(text) {
-                                Ok(m) => log_server_msg(&m),
+                                Ok(m) => handle_server_msg(m, cfg, &out_tx, &registry),
                                 Err(err) => log(format!("failed to parse server message: {err}")),
                             }
                         }
@@ -277,7 +349,202 @@ async fn connect_and_run(cfg: &Config, shutdown: &mut watch::Receiver<bool>) -> 
     }
 }
 
-/// `bye` を送る。
+/// 受信メッセージをログし、実行が必要なものをタスクとして起動する。
+fn handle_server_msg(msg: ServerMsg, cfg: &Config, out: &Outbox, registry: &Registry) {
+    log_server_msg(&msg);
+    match msg {
+        ServerMsg::TaskAssign { task_id, payload } => {
+            let cancelled: CancelFlag = Arc::new(AtomicBool::new(false));
+            registry
+                .lock()
+                .unwrap()
+                .insert(task_id.clone(), cancelled.clone());
+            let cfg = cfg.clone();
+            let out = out.clone();
+            let registry = registry.clone();
+            // 実行を別タスクに逃がし、読み取りループ / heartbeat を止めない。
+            tokio::spawn(async move {
+                run_task(task_id, payload, cfg, out, cancelled, registry).await;
+            });
+        }
+        ServerMsg::TaskCancel { task_id, reason } => {
+            match registry.lock().unwrap().get(&task_id).cloned() {
+                Some(flag) => {
+                    flag.store(true, Ordering::SeqCst);
+                    log(format!(
+                        "task_cancel: task_id={task_id} reason={reason} (cancellation requested)"
+                    ));
+                }
+                None => log(format!(
+                    "task_cancel: task_id={task_id} reason={reason} (no running task)"
+                )),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 実行結果（local / remote 共通）。
+struct TaskOutcome {
+    status: &'static str,
+    summary: String,
+    detail: String,
+    artifacts: Vec<Artifact>,
+}
+
+fn fail(reason: impl Into<String>) -> TaskOutcome {
+    let reason = reason.into();
+    TaskOutcome {
+        status: "failed",
+        summary: reason.clone(),
+        detail: reason,
+        artifacts: Vec::new(),
+    }
+}
+
+/// 1 タスクを実行し、必ず `task_result` を 1 通送る。
+async fn run_task(
+    task_id: String,
+    payload: serde_json::Value,
+    cfg: Config,
+    out: Outbox,
+    cancelled: CancelFlag,
+    registry: Registry,
+) {
+    let outcome = execute_task(&task_id, &payload, &cfg, &out, &cancelled).await;
+
+    // 後始末（登録解除）。
+    registry.lock().unwrap().remove(&task_id);
+
+    let msg = task_result_msg(&task_id, &outcome);
+    match out.send(msg.to_json()).await {
+        Ok(()) => log(format!(
+            "task {task_id}: task_result sent (status={})",
+            outcome.status
+        )),
+        Err(_) => log(format!(
+            "task {task_id}: connection closed; task_result could not be sent"
+        )),
+    }
+}
+
+/// `TaskOutcome` を `task_result` メッセージに変換する（テスト可能にするため分離）。
+fn task_result_msg(task_id: &str, outcome: &TaskOutcome) -> ClientMsg {
+    ClientMsg::TaskResult {
+        task_id: task_id.to_string(),
+        status: outcome.status.to_string(),
+        summary: outcome.summary.clone(),
+        detail: outcome.detail.clone(),
+        artifacts: outcome.artifacts.clone(),
+    }
+}
+
+/// payload を解釈してモード別に実行する。失敗は必ず `failed` の [`TaskOutcome`] にする。
+async fn execute_task(
+    task_id: &str,
+    payload: &serde_json::Value,
+    cfg: &Config,
+    out: &Outbox,
+    cancelled: &CancelFlag,
+) -> TaskOutcome {
+    let payload: TaskAssignPayload = match serde_json::from_value(payload.clone()) {
+        Ok(p) => p,
+        Err(err) => return fail(format!("task_assign の payload を解析できません: {err}")),
+    };
+
+    let mode = if payload.mode.trim().is_empty() {
+        // 未指定は既定の local として扱う（§13.4 の tasks.mode 既定に合わせる）。
+        "local"
+    } else {
+        payload.mode.trim()
+    };
+
+    match mode {
+        "local" => {
+            let env = build_local_env(cfg);
+            let progress_task_id = task_id.to_string();
+            let progress_out = out.clone();
+            let cancelled = cancelled.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let mut on_progress = move |percent: u8, message: &str| {
+                    let msg = ClientMsg::TaskProgress {
+                        task_id: progress_task_id.clone(),
+                        message: message.to_string(),
+                        percent,
+                    };
+                    let _ = progress_out.try_send(msg.to_json());
+                };
+                local::execute_local(&payload, &env, &cancelled, &mut on_progress)
+            })
+            .await;
+
+            match joined {
+                Ok(r) => TaskOutcome {
+                    status: r.status,
+                    summary: r.summary,
+                    detail: r.detail,
+                    artifacts: r.artifacts,
+                },
+                Err(err) => fail(format!("local 実行タスクが失敗しました: {err}")),
+            }
+        }
+        "remote" => {
+            let Some(spec) = payload.remote.clone() else {
+                return fail("remote モードですが remote 指定がありません".to_string());
+            };
+            let env = remote::RemoteEnv {
+                api_base: cfg.github_api_url.clone(),
+            };
+            let progress_task_id = task_id.to_string();
+            let progress_out = out.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let mut on_progress = move |percent: u8, message: &str| {
+                    let msg = ClientMsg::TaskProgress {
+                        task_id: progress_task_id.clone(),
+                        message: message.to_string(),
+                        percent,
+                    };
+                    let _ = progress_out.try_send(msg.to_json());
+                };
+                remote::execute_remote(&spec, &env, &mut on_progress)
+            })
+            .await;
+
+            match joined {
+                Ok(r) => TaskOutcome {
+                    status: r.status,
+                    summary: r.summary,
+                    detail: r.detail,
+                    artifacts: r.artifacts,
+                },
+                Err(err) => fail(format!("remote 実行タスクが失敗しました: {err}")),
+            }
+        }
+        other => fail(format!("未知の mode です: {other:?}")),
+    }
+}
+
+/// `Config` から local 実行環境を組み立てる（bwrap 不在なら `none` に落とす）。
+fn build_local_env(cfg: &Config) -> local::LocalEnv {
+    let (mut mode, warning) = sandbox::SandboxMode::from_env_value(&cfg.sandbox_raw);
+    if let Some(warning) = warning {
+        log(warning);
+    }
+    if mode == sandbox::SandboxMode::Bwrap && !sandbox::bwrap_available() {
+        log(
+            "bwrap not found in PATH; falling back to OFFICE_SANDBOX=none \
+             (workspace path checks are still enforced)",
+        );
+        mode = sandbox::SandboxMode::None;
+    }
+    local::LocalEnv {
+        root: cfg.workspace.clone(),
+        allow_exec: cfg.allow_exec,
+        sandbox: mode,
+    }
+}
+
+/// `bye` を送る（welcome 待ちの間のみ使用）。
 async fn send_bye(sink: &mut WsSink) -> Result<()> {
     let bye = ClientMsg::Bye {
         reason: "shutdown".to_string(),
@@ -307,6 +574,9 @@ fn log_server_msg(msg: &ServerMsg) {
         ServerMsg::TaskAssign { task_id, payload } => {
             log(format!("task_assign: task_id={task_id} payload={payload}"));
         }
+        ServerMsg::TaskCancel { task_id, reason } => {
+            log(format!("task_cancel: task_id={task_id} reason={reason}"));
+        }
         ServerMsg::Error { code, message } => {
             log(format!("server error: code={code} message={message}"));
         }
@@ -315,14 +585,16 @@ fn log_server_msg(msg: &ServerMsg) {
             employees,
             ledger,
             relationships,
+            tasks,
             ts,
         } => {
             log(format!(
-                "office_state: online=[{}] employees={} ledger={} relationships={} ts={ts}",
+                "office_state: online=[{}] employees={} ledger={} relationships={} tasks={} ts={ts}",
                 online.join(", "),
                 employees.len(),
                 ledger.len(),
-                relationships.len()
+                relationships.len(),
+                tasks.len()
             ));
         }
         ServerMsg::Unknown => {
@@ -412,6 +684,25 @@ fn env_string(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// 空でない環境変数を `PathBuf` として読む。
+fn env_opt_path(key: &str) -> Option<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `1` / `true` / `yes`（大文字小文字を問わない）を真として読む。
+fn env_flag(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// u64 の環境変数を読む。未設定・空文字・パース失敗なら既定値。
 fn env_u64(key: &str, default: u64) -> u64 {
     match std::env::var(key) {
@@ -430,7 +721,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::backoff_delay;
+    use super::{backoff_delay, env_flag};
     use std::time::Duration;
 
     #[test]
@@ -442,5 +733,39 @@ mod tests {
         assert_eq!(backoff_delay(5), Duration::from_secs(16));
         assert_eq!(backoff_delay(6), Duration::from_secs(30));
         assert_eq!(backoff_delay(100), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn env_flag_accepts_expected_values() {
+        // 安全側: 未設定は false。
+        unsafe { std::env::remove_var("OFFICE_TEST_FLAG") };
+        assert!(!env_flag("OFFICE_TEST_FLAG"));
+        unsafe { std::env::set_var("OFFICE_TEST_FLAG", "1") };
+        assert!(env_flag("OFFICE_TEST_FLAG"));
+        unsafe { std::env::set_var("OFFICE_TEST_FLAG", "true") };
+        assert!(env_flag("OFFICE_TEST_FLAG"));
+        unsafe { std::env::set_var("OFFICE_TEST_FLAG", "0") };
+        assert!(!env_flag("OFFICE_TEST_FLAG"));
+        unsafe { std::env::remove_var("OFFICE_TEST_FLAG") };
+    }
+
+    #[test]
+    fn task_result_message_carries_status_and_pr_url() {
+        let outcome = super::TaskOutcome {
+            status: "done",
+            summary: "PR を作成しました: https://github.com/o/r/pull/7".to_string(),
+            detail: "log".to_string(),
+            artifacts: Vec::new(),
+        };
+        let msg = super::task_result_msg("t1", &outcome);
+        let json = msg.to_json();
+        assert!(json.contains(r#""type":"task_result""#));
+        assert!(json.contains(r#""status":"done""#));
+        assert!(json.contains("https://github.com/o/r/pull/7"));
+
+        let failed = super::task_result_msg("t2", &super::fail("token 未設定"));
+        let json = failed.to_json();
+        assert!(json.contains(r#""status":"failed""#));
+        assert!(json.contains("token 未設定"));
     }
 }

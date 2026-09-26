@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 
 	"github.com/yukirawa/ai-office/server/internal/agents"
 	"github.com/yukirawa/ai-office/server/internal/config"
@@ -50,6 +49,11 @@ type Server struct {
 	mu          sync.RWMutex
 	manager     *agents.Manager
 	agentStates map[string]string
+	ghClient    gh.Client
+
+	// waiters は task_result を待つ DevAgent への受け渡し（tasks.go）。
+	waitersMu sync.Mutex
+	waiters   map[string]*waiter
 }
 
 // New は Server を生成する。
@@ -67,6 +71,7 @@ func New(d Deps) *Server {
 		hub:         newHub(),
 		manager:     d.Manager,
 		agentStates: make(map[string]string),
+		waiters:     make(map[string]*waiter),
 	}
 	return s
 }
@@ -207,11 +212,13 @@ func (s *Server) Handler() http.Handler {
 	// 関係値（設計書 §5 の relationships。TUI 右ペイン用の拡張エンドポイント）
 	r.Get("/api/relationships/{id}", s.handleRelationships)
 
-	// オーナーからのタスク投入（Phase 2 の前倒し。mgr に計画させる）
+	// オーナーからのタスク投入（Phase 2 で実行まで配線）
 	r.Post("/api/tasks", s.handleCreateTask)
+	r.Get("/api/tasks", s.handleListTasks)
 
-	// §4.3 /webhook/github（Phase 3 で実装。今は 501）
-	r.Post("/webhook/github", gh.Handler())
+	// §4.3 /webhook/github
+	// Phase 3: 署名検証してタスク化する。secret は cfg（env GITHUB_WEBHOOK_SECRET）。
+	r.Post("/webhook/github", gh.Handler(s.cfg.GitHubWebhookSecret, s.handleWebhookEvent))
 
 	return r
 }
@@ -345,61 +352,45 @@ func (s *Server) handleRelationships(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// handleCreateTask はオーナーからのタスク投入を受け付ける（Phase 2 の前倒し）。
-// tasks に保存し、mgr エージェントの Inbox へ渡して計画を立てさせる。
+// handleCreateTask はオーナーからのタスク投入を受け付ける（§6.1、Phase 2 で実行まで配線）。
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Title       string `json:"title"`
 		Description string `json:"description"`
 		From        string `json:"from"`
+		Mode        string `json:"mode"`
+		Repo        string `json:"repo"`
+		BaseBranch  string `json:"base_branch"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "JSON の解釈に失敗しました")
 		return
 	}
-	body.Title = strings.TrimSpace(body.Title)
-	if body.Title == "" {
-		writeJSONError(w, http.StatusBadRequest, "title は必須です")
-		return
-	}
-	if strings.TrimSpace(body.From) == "" {
-		body.From = "owner"
-	}
 
-	id := newID()
-	now := time.Now().UTC()
-	task := store.Task{
-		ID:          id,
+	id, err := s.CreateTask(r.Context(), CreateTaskInput{
 		Title:       body.Title,
 		Description: body.Description,
-		Status:      "assigned",
-		Assignee:    config.EmployeeManagerID,
-		CreatedBy:   body.From,
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}
-	if err := s.store.InsertTask(task); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "タスクの保存に失敗しました")
+		From:        body.From,
+		Mode:        body.Mode,
+		Repo:        body.Repo,
+		BaseBranch:  body.BaseBranch,
+	})
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "必須") {
+			status = http.StatusBadRequest
+		}
+		if strings.Contains(err.Error(), "満杯") {
+			status = http.StatusServiceUnavailable
+		}
+		writeJSONError(w, status, err.Error())
 		return
 	}
 
-	if m := s.Manager(); m != nil {
-		if ok := m.Post(agents.Task{
-			ID:          id,
-			Title:       body.Title,
-			Description: body.Description,
-			From:        body.From,
-		}); !ok {
-			writeJSONError(w, http.StatusServiceUnavailable, "mgr の受信箱が満杯です")
-			return
-		}
-	}
-
-	s.log.Info("タスクを受け付けました", "task_id", id, "title", body.Title, "from", body.From)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"task_id":  id,
-		"status":   task.Status,
-		"assignee": task.Assignee,
+		"status":   "pending",
+		"assignee": config.EmployeeManagerID,
 	})
 }
 
@@ -421,9 +412,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
-}
-
-// newID はタスク ID などに使う UUID v4 文字列を返す。
-func newID() string {
-	return uuid.NewString()
 }

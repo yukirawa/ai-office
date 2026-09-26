@@ -451,3 +451,67 @@ CIは最初は入れない。Phase 2 まで来たら GitHub Actions で go test 
 - `tui --snapshot`（または `OFFICE_TUI_SNAPSHOT=1`）でヘッドレスに状態サマリを出力して終了する
   モードを追加。CI や自動E2Eで描画ループを介さず検証できる。
 - worker の再接続は指数バックオフ（1→2→4→…→30 秒、`OFFICE_MAX_RETRIES=0` は無限）。
+
+---
+
+## 13. Phase 2/3 で追加したプロトコル（§4.2 追補）
+
+§4.2 の「新しい type の追加は自由」に従い、以下を追加する。既存 type は変更しない。
+
+### 13.1 Client → Server
+
+- `task_result` — ワーカーの実行結果（Phase 2.2）。
+  ```json
+  {"type":"task_result","task_id":"uuid","status":"done",
+   "summary":"1行の要約","detail":"詳細ログ",
+   "artifacts":[{"path":"reports/x.md","bytes":123}]}
+  ```
+  `status` は `done` | `failed`。
+- `task_progress` — 実行中の進捗（Phase 2.2、任意）。
+  ```json
+  {"type":"task_progress","task_id":"uuid","message":"...","percent":50}
+  ```
+
+### 13.2 Server → Client
+
+- `task_assign` の `payload` を確定（Phase 2.2）。
+  ```json
+  {"type":"task_assign","task_id":"uuid","payload":{
+     "mode":"local",
+     "title":"...",
+     "reason":"mgr の計画や意図",
+     "actions":[{"op":"write","path":"reports/x.md","content":"..."}]
+  }}
+  ```
+  `mode` は `local`（ファイル操作・コマンド） | `remote`（GitHub API）。
+  - `local` の `actions[]`: `{"op":"read|write|list|exec", ...}`。
+    `write` は `path`+`content`、`exec` は `cmd`+`args`+`cwd`。
+  - `remote` の `remote`: `{"repo","base_branch","branch","title","body","files":[{"path","content"}],"token"}`。
+    `token` はサーバーが発行する短命の installation token（Tailscale 内でのみ流通）。
+- `task_cancel` — 割り当て済みタスクの取り消し（予約）。
+  ```json
+  {"type":"task_cancel","task_id":"uuid","reason":"..."}
+  ```
+
+### 13.3 タスクの状態遷移（§5 の status を実運用）
+
+`pending` →（mgr が担当を決定）→ `assigned` →（dev が実行開始）→ `working`
+→（結果報告）→ `review` →（mgr が承認）→ `done` ／ 失敗時は `failed`。
+
+### 13.4 データモデル追補（§5）
+
+tasks に 3 列を追加（§5 の「カラム追加はOK」）: `mode`（既定 `local`）、`repo`、`base_branch`。
+
+### 13.5 ワーカー（Local / Remote）の設定とサンドボックス（§7.3）
+
+- `OFFICE_WORKSPACE` — local モードで読み書きできる作業ディレクトリ（必須）。
+- `OFFICE_SANDBOX` — `bwrap`（既定） | `none`。`bwrap` が無ければ警告して `none` に落とす。
+- `OFFICE_ALLOW_EXEC` — `1` のときだけ `exec` アクションを許可（既定 `0`、安全側）。
+- bubblewrap は workspace のみ bind（read-write）、ネットワークは `--unshare-net`、その他は read-only。
+- Remote モードは GitHub REST API を直接叩く（サーバーから渡された installation token を使う）。
+
+### 13.6 GitHub App（Phase 3）の設定
+
+`GITHUB_APP_ID`, `GITHUB_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`（既定 `secrets/github-app.pem`）,
+`GITHUB_WEBHOOK_SECRET`, `GITHUB_REPO`, `GITHUB_BASE_BRANCH`（既定 `main`）。
+未設定なら GitHub 連携は無効のまま起動する。webhook は HMAC-SHA256（`X-Hub-Signature-256`）で検証する。
