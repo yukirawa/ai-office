@@ -16,6 +16,8 @@ HTTP="http://127.0.0.1:${PORT}"
 OUT="${ROOT}/server/data/demo"
 
 mkdir -p "${OUT}"
+rm -rf "${OUT}/ws"
+mkdir -p "${OUT}/ws/dev_m" "${OUT}/ws/dev_f"
 
 echo "== build =="
 (cd "${ROOT}/server" && go build -o "${OUT}/officed" ./cmd/officed)
@@ -40,9 +42,11 @@ sleep 1
 
 echo "== start workers (dev_m, dev_f) =="
 OFFICE_SERVER_URL="${BASE}" OFFICE_EMPLOYEE_ID=dev_m OFFICE_DEVICE_ID=zenbook \
+  OFFICE_WORKSPACE="${OUT}/ws/dev_m" \
   "${ROOT}/client/target/debug/worker" > "${OUT}/dev_m.log" 2>&1 &
 W1_PID=$!
 OFFICE_SERVER_URL="${BASE}" OFFICE_EMPLOYEE_ID=dev_f OFFICE_DEVICE_ID=zenbook \
+  OFFICE_WORKSPACE="${OUT}/ws/dev_f" \
   "${ROOT}/client/target/debug/worker" > "${OUT}/dev_f.log" 2>&1 &
 W2_PID=$!
 sleep 2

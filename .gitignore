@@ -20,6 +20,7 @@ secrets/
 *.db-journal
 *.log
 server/data/
+client/data/
 
 # エディタ・OS
 .vscode/

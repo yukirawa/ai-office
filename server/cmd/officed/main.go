@@ -33,11 +33,121 @@ import (
 const shutdownTimeout = 5 * time.Second
 
 func main() {
+	// 実 API キー/モデルの聴通確認（サーバは起動しない）。
+	if len(os.Args) > 1 && os.Args[1] == "--llm-check" {
+		if err := runLLMCheck(); err != nil {
+			fmt.Fprintln(os.Stderr, "llm-check:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// 実 API キーで利用可能なモデル一覧を確認する（トークン消費なし）。
+	if len(os.Args) > 1 && os.Args[1] == "--llm-models" {
+		if err := runLLMModels(); err != nil {
+			fmt.Fprintln(os.Stderr, "llm-models:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		// run 内でログ済みだが、起動失敗は必ず非ゼロで終える。
 		fmt.Fprintln(os.Stderr, "officed:", err)
 		os.Exit(1)
 	}
+}
+
+// runLLMModels は実 API キーで利用可能なモデル一覧を表示する（--llm-models）。
+// Anthropic 以外（mock 等）ではエラーを返す。
+func runLLMModels() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	logger := newLogger(cfg.LogLevel)
+
+	if err := requireLLMKey(cfg); err != nil {
+		return err
+	}
+
+	client := buildLLM(cfg, logger)
+	type modelLister interface {
+		Models(ctx context.Context) ([]string, error)
+	}
+	lister, ok := client.(modelLister)
+	if !ok {
+		return fmt.Errorf("プロバイダ %q ではモデル一覧を取得できません（OFFICE_LLM_PROVIDER=anthropic で試してください）", cfg.LLMProvider)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	models, err := lister.Models(ctx)
+	if err != nil {
+		return fmt.Errorf("モデル一覧の取得に失敗しました: %w", err)
+	}
+
+	fmt.Printf("利用可能なモデル (%d 件):\n", len(models))
+	for _, m := range models {
+		fmt.Printf("  - %s\n", m)
+	}
+	fmt.Println("\n使いたいモデル名を OFFICE_LLM_MODEL に設定してください。")
+	return nil
+}
+
+// requireLLMKey は選んだプロバイダの API キーが無ければエラーを返す（診断コマンド用）。
+// mock はキー不要なのでエラーにしない。
+func requireLLMKey(cfg *config.Config) error {
+	switch strings.ToLower(strings.TrimSpace(cfg.LLMProvider)) {
+	case "anthropic":
+		if strings.TrimSpace(cfg.AnthropicAPIKey) == "" {
+			return errors.New("ANTHROPIC_API_KEY が未設定です（環境変数 / .env / secrets/anthropic.key のいずれかに設定してください）")
+		}
+	case "deepseek":
+		if strings.TrimSpace(cfg.DeepSeekAPIKey) == "" {
+			return errors.New("DEEPSEEK_API_KEY が未設定です（環境変数 / .env / secrets/deepseek.key のいずれかに設定してください）")
+		}
+	}
+	return nil
+}
+
+// runLLMCheck は実 API キー/モデルの聴通を 1 回の Chat で確認する（--llm-check）。
+// サーバを起動せずに使えるので、キーの動作テストの入口になる。
+func runLLMCheck() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	logger := newLogger(cfg.LogLevel)
+
+	if err := requireLLMKey(cfg); err != nil {
+		return err
+	}
+
+	client := buildLLM(cfg, logger)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	resp, err := client.Chat(ctx, llm.Request{
+		Model:     cfg.LLMModel,
+		System:    "接続確認です。簡潔に日本語で返してください。",
+		Messages:  []llm.Message{{Role: "user", Content: "『pong』とだけ返してください。"}},
+		MaxTokens: 32,
+	})
+	if err != nil {
+		return fmt.Errorf("LLM 呼び出しに失敗しました: %w", err)
+	}
+
+	model := strings.TrimSpace(resp.Model)
+	if model == "" {
+		model = cfg.LLMModel
+	}
+	fmt.Printf("provider=%s model=%s elapsed=%s tokens(in/out)=%d/%d\nreply=%s\n",
+		cfg.LLMProvider, model, time.Since(start).Round(time.Millisecond),
+		resp.InputTokens, resp.OutputTokens, strings.TrimSpace(resp.Text))
+	return nil
 }
 
 func run() error {
@@ -79,6 +189,7 @@ func run() error {
 		Store:    st,
 		Presence: reg,
 		Economy:  econ,
+		LLM:      client,
 		Logger:   logger,
 	})
 	mgr := agents.NewManager(
@@ -218,19 +329,30 @@ func buildLLM(cfg *config.Config, logger *slog.Logger) llm.Client {
 			logger.Warn("ANTHROPIC_API_KEY が未設定のため mock プロバイダで動作します")
 			return mockLLM()
 		}
-		logger.Info("LLM プロバイダ: anthropic", "model", cfg.LLMModel, "base_url", cfg.AnthropicBaseURL)
-		return llm.NewAnthropic(cfg.AnthropicAPIKey, cfg.AnthropicBaseURL)
+		anthropic := llm.NewAnthropic(cfg.AnthropicAPIKey, cfg.AnthropicBaseURL, llm.WithTimeout(cfg.LLMTimeout))
+		logger.Info("LLM プロバイダ: anthropic", "model", cfg.LLMModel, "client", anthropic.String())
+		return anthropic
+	case "deepseek":
+		if cfg.DeepSeekAPIKey == "" {
+			logger.Warn("DEEPSEEK_API_KEY が未設定のため mock プロバイダで動作します")
+			return mockLLM()
+		}
+		deepseek := llm.NewDeepSeek(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, llm.WithTimeout(cfg.LLMTimeout))
+		logger.Info("LLM プロバイダ: deepseek", "model", cfg.LLMModel, "client", deepseek.String())
+		return deepseek
 	default:
 		logger.Info("LLM プロバイダ: mock（外部 API を呼びません）")
 		return mockLLM()
 	}
 }
 
-// agentOptions は mgr / dev 共通の Options を設定から組み立てる。
+// agentOptions は mgr / dev / chat 共通の Options を設定から組み立てる。
 func agentOptions(cfg *config.Config, logger *slog.Logger) agents.Options {
 	return agents.Options{
 		MaxTurns:    cfg.MaxAgentTurns,
 		TokenBudget: cfg.TokenBudget,
+		Model:       cfg.LLMModel,
+		MaxTokens:   cfg.LLMMaxTokens,
 		Channel:     "#会議室",
 		Logger:      logger,
 	}

@@ -12,6 +12,7 @@ func clearEnv(t *testing.T) {
 		"OFFICE_ADDR", "OFFICE_DB", "OFFICE_HEARTBEAT_TIMEOUT",
 		"OFFICE_PAYROLL_CRON", "OFFICE_PAYROLL_TZ",
 		"OFFICE_LLM_PROVIDER", "OFFICE_LLM_MODEL", "OFFICE_ANTHROPIC_BASE_URL",
+		"OFFICE_LLM_TIMEOUT", "OFFICE_LLM_MAX_TOKENS",
 		"OFFICE_MAX_AGENT_TURNS", "OFFICE_TOKEN_BUDGET", "OFFICE_LOG_LEVEL",
 	} {
 		t.Setenv(k, "")
@@ -38,6 +39,8 @@ func TestLoadDefaults(t *testing.T) {
 		{"PayrollTimezone", cfg.PayrollTimezone, "Asia/Tokyo"},
 		{"LLMProvider", cfg.LLMProvider, "mock"},
 		{"LLMModel", cfg.LLMModel, "claude-3-5-haiku-latest"},
+		{"LLMTimeout", cfg.LLMTimeout, 120 * time.Second},
+		{"LLMMaxTokens", cfg.LLMMaxTokens, 1024},
 		{"AnthropicBaseURL", cfg.AnthropicBaseURL, "https://api.anthropic.com"},
 		{"MaxAgentTurns", cfg.MaxAgentTurns, 8},
 		{"TokenBudget", cfg.TokenBudget, 20000},
@@ -58,6 +61,8 @@ func TestLoadOverride(t *testing.T) {
 	t.Setenv("OFFICE_MAX_AGENT_TURNS", "3")
 	t.Setenv("OFFICE_TOKEN_BUDGET", "1234")
 	t.Setenv("OFFICE_LLM_PROVIDER", "anthropic")
+	t.Setenv("OFFICE_LLM_TIMEOUT", "5s")
+	t.Setenv("OFFICE_LLM_MAX_TOKENS", "256")
 	t.Setenv("OFFICE_LOG_LEVEL", "debug")
 
 	cfg, err := Load()
@@ -76,6 +81,9 @@ func TestLoadOverride(t *testing.T) {
 	if cfg.LLMProvider != "anthropic" || cfg.LogLevel != "debug" {
 		t.Errorf("LLMProvider/LogLevel = %q/%q", cfg.LLMProvider, cfg.LogLevel)
 	}
+	if cfg.LLMTimeout != 5*time.Second || cfg.LLMMaxTokens != 256 {
+		t.Errorf("LLMTimeout/LLMMaxTokens = %v/%d", cfg.LLMTimeout, cfg.LLMMaxTokens)
+	}
 }
 
 func TestLoadInvalidEnv(t *testing.T) {
@@ -89,6 +97,18 @@ func TestLoadInvalidEnv(t *testing.T) {
 	t.Setenv("OFFICE_MAX_AGENT_TURNS", "abc")
 	if _, err := Load(); err == nil {
 		t.Error("不正な整数でエラーにならなかった")
+	}
+
+	clearEnv(t)
+	t.Setenv("OFFICE_LLM_TIMEOUT", "soon")
+	if _, err := Load(); err == nil {
+		t.Error("不正な OFFICE_LLM_TIMEOUT でエラーにならなかった")
+	}
+
+	clearEnv(t)
+	t.Setenv("OFFICE_LLM_MAX_TOKENS", "lots")
+	if _, err := Load(); err == nil {
+		t.Error("不正な OFFICE_LLM_MAX_TOKENS でエラーにならなかった")
 	}
 }
 

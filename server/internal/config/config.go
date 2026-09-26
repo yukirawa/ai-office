@@ -24,7 +24,11 @@ const (
 	defaultChatCron         = "0 * * * *"
 	defaultLLMProvider      = "mock"
 	defaultLLMModel         = "claude-3-5-haiku-latest"
+	defaultLLMTimeout       = 120 * time.Second
+	defaultLLMMaxTokens     = 1024
 	defaultAnthropicBaseURL = "https://api.anthropic.com"
+	defaultDeepSeekBaseURL  = "https://api.deepseek.com"
+	defaultDeepSeekModel    = "deepseek-chat"
 	defaultMaxAgentTurns    = 8
 	defaultTokenBudget      = 20000
 	defaultLogLevel         = "info"
@@ -68,10 +72,18 @@ type Config struct {
 	LLMProvider string
 	// LLMModel は LLM のモデル名（env OFFICE_LLM_MODEL）。
 	LLMModel string
+	// LLMTimeout は LLM 呼び出し 1 回のタイムアウト（env OFFICE_LLM_TIMEOUT）。
+	LLMTimeout time.Duration
+	// LLMMaxTokens は LLM 応答の最大トークン数（env OFFICE_LLM_MAX_TOKENS）。
+	LLMMaxTokens int
 	// AnthropicAPIKey は Anthropic API キー（env ANTHROPIC_API_KEY、無ければ secrets/anthropic.key）。
 	AnthropicAPIKey string
 	// AnthropicBaseURL は Anthropic API のベース URL（env OFFICE_ANTHROPIC_BASE_URL）。
 	AnthropicBaseURL string
+	// DeepSeekAPIKey は DeepSeek API キー（env DEEPSEEK_API_KEY、無ければ secrets/deepseek.key）。
+	DeepSeekAPIKey string
+	// DeepSeekBaseURL は DeepSeek API のベース URL（env OFFICE_DEEPSEEK_BASE_URL）。
+	DeepSeekBaseURL string
 	// MaxAgentTurns はエージェント 1 タスクあたりの最大ターン数（env OFFICE_MAX_AGENT_TURNS）。
 	MaxAgentTurns int
 	// TokenBudget はエージェント 1 タスクあたりのトークン予算（env OFFICE_TOKEN_BUDGET）。
@@ -100,6 +112,9 @@ type Config struct {
 // Load は環境変数から Config を読み込む。
 // 空文字の環境変数は「未設定」として既定値を使う。
 func Load() (*Config, error) {
+	// プロジェクトルートの .env があれば取り込む（既存の環境変数が優先）。
+	loadDotEnv()
+
 	heartbeat, err := durationEnv("OFFICE_HEARTBEAT_TIMEOUT", defaultHeartbeatTimeout)
 	if err != nil {
 		return nil, err
@@ -109,6 +124,14 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	tokenBudget, err := intEnv("OFFICE_TOKEN_BUDGET", defaultTokenBudget)
+	if err != nil {
+		return nil, err
+	}
+	llmTimeout, err := durationEnv("OFFICE_LLM_TIMEOUT", defaultLLMTimeout)
+	if err != nil {
+		return nil, err
+	}
+	llmMaxTokens, err := intEnv("OFFICE_LLM_MAX_TOKENS", defaultLLMMaxTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -128,6 +151,22 @@ func Load() (*Config, error) {
 		apiKey = readSecretFile("anthropic.key")
 	}
 
+	dsKey := strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY"))
+	if dsKey == "" {
+		dsKey = readSecretFile("deepseek.key")
+	}
+
+	// モデル名は明示が優先。未設定ならプロバイダごとの既定を使う。
+	provider := stringEnv("OFFICE_LLM_PROVIDER", defaultLLMProvider)
+	model := strings.TrimSpace(os.Getenv("OFFICE_LLM_MODEL"))
+	if model == "" {
+		if strings.EqualFold(provider, "deepseek") {
+			model = defaultDeepSeekModel
+		} else {
+			model = defaultLLMModel
+		}
+	}
+
 	ghKeyPath := stringEnv("GITHUB_APP_PRIVATE_KEY_PATH", filepath.Join("secrets", "github-app.pem"))
 	ghPEM := strings.TrimSpace(os.Getenv("GITHUB_PRIVATE_KEY"))
 	if ghPEM == "" {
@@ -141,10 +180,14 @@ func Load() (*Config, error) {
 		PayrollCron:          stringEnv("OFFICE_PAYROLL_CRON", defaultPayrollCron),
 		PayrollTimezone:      stringEnv("OFFICE_PAYROLL_TZ", defaultPayrollTimezone),
 		ChatCron:             stringEnv("OFFICE_CHAT_CRON", defaultChatCron),
-		LLMProvider:          stringEnv("OFFICE_LLM_PROVIDER", defaultLLMProvider),
-		LLMModel:             stringEnv("OFFICE_LLM_MODEL", defaultLLMModel),
+		LLMProvider:          provider,
+		LLMModel:             model,
+		LLMTimeout:           llmTimeout,
+		LLMMaxTokens:         llmMaxTokens,
 		AnthropicAPIKey:      apiKey,
 		AnthropicBaseURL:     stringEnv("OFFICE_ANTHROPIC_BASE_URL", defaultAnthropicBaseURL),
+		DeepSeekAPIKey:       dsKey,
+		DeepSeekBaseURL:      stringEnv("OFFICE_DEEPSEEK_BASE_URL", defaultDeepSeekBaseURL),
 		MaxAgentTurns:        maxTurns,
 		TokenBudget:          tokenBudget,
 		LogLevel:             stringEnv("OFFICE_LOG_LEVEL", defaultLogLevel),

@@ -264,9 +264,10 @@ func (d *DevAgent) buildAssign(ctx context.Context, t Task) (TaskAssign, string)
 // 無限ループ防止（最大ターン数・トークン予算・同一結論検出）を mgr と同じ規律で適用する。
 func (d *DevAgent) planWithLLM(ctx context.Context, t Task, remote bool) ([]Action, []RemoteFile, string) {
 	req := llm.Request{
-		Model:    DefaultModel,
-		System:   d.systemPrompt(remote),
-		Messages: []llm.Message{{Role: "user", Content: assignPrompt(t, remote)}},
+		Model:     d.opts.Model,
+		System:    d.systemPrompt(remote),
+		Messages:  []llm.Message{{Role: "user", Content: assignPrompt(t, remote)}},
+		MaxTokens: d.opts.MaxTokens,
 	}
 
 	tokensUsed := 0

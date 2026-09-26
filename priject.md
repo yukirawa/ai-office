@@ -515,3 +515,29 @@ tasks に 3 列を追加（§5 の「カラム追加はOK」）: `mode`（既定
 `GITHUB_APP_ID`, `GITHUB_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`（既定 `secrets/github-app.pem`）,
 `GITHUB_WEBHOOK_SECRET`, `GITHUB_REPO`, `GITHUB_BASE_BRANCH`（既定 `main`）。
 未設定なら GitHub 連携は無効のまま起動する。webhook は HMAC-SHA256（`X-Hub-Signature-256`）で検証する。
+
+---
+
+## 14. LLM 実運用メモ（Phase 1-4 の仕上げ）
+
+§11「LLM初期モデル選定」を実キーで試せる形にするために、以下を実装した。
+
+- モデル名・トークン上限の注入: `agents.Options` に `Model` / `MaxTokens` を追加し、mgr / dev / chat の
+  全 `llm.Request` で使う。以前は `DefaultModel` 固定で `OFFICE_LLM_MODEL` が無視されていた。
+- `internal/config`: `OFFICE_LLM_TIMEOUT`（既定 120s）、`OFFICE_LLM_MAX_TOKENS`（既定 1024）。
+- `internal/llm`（Anthropic）: 可変長オプション `WithTimeout` / `WithMaxRetries`（既定 3）/
+  `WithRetryBaseDelay`。リトライは 429/5xx とネットワークエラーのみ。`Retry-After` を尊重。
+  401 には「API キーを確認」、404 には「モデル名を確認」のヒントを付ける。
+- 診断: `officed --llm-check`（1 回の Chat で聴通確認）、`officed --llm-models`
+  （`GET /v1/models` で利用可能モデル一覧、トークン消費なし）。
+  起動中は `GET /api/llm` と `POST /api/llm/ping` でも確認できる。
+- 既定モデルはプロバイダ依存。`deepseek` のときは `deepseek-chat`、それ以外は `claude-3-5-haiku-latest`
+  （いずれも `OFFICE_LLM_MODEL` で上書き）。
+- DeepSeek ネイティブ対応: `internal/llm/deepseek.go` に OpenAI 互換 API（`POST /chat/completions`,
+  `GET /models`, `Authorization: Bearer`）を実装。`OFFICE_LLM_PROVIDER=deepseek` で選択。
+  `Option`（`WithTimeout` / `WithMaxRetries` / `WithRetryBaseDelay`）は Anthropic と共通化した。
+  `--llm-models` も DeepSeek に対応する。
+- 設定の入口: プロジェクトルートの `.env`（`officed` が自動読込。既存の環境変数が優先）。
+  キーは env / `.env` / `secrets/<provider>.key` のいずれでも可。
+- 起動: `start-server` / `start-client`（リポジトリ直下と `~/.local/bin`）。実体は `scripts/server.sh` /
+  `scripts/client.sh`。

@@ -33,6 +33,8 @@ const (
 	defaultMaxTurns = 8
 	// defaultTokenBudget は 1 タスクあたりの入出力合計トークン上限（§6.3）。
 	defaultTokenBudget = 20000
+	// defaultMaxTokens は 1 リクエストあたりの最大出力トークンの既定値。
+	defaultMaxTokens = 1024
 	// defaultChannel は報告先の既定チャンネル。
 	defaultChannel = "#会議室"
 	// inboxCapacity は受信箱のバッファ容量。Post はノンブロッキングなので溢れたら false。
@@ -41,8 +43,10 @@ const (
 	repeatConclusionLimit = 3
 )
 
-// DefaultModel は Phase 1 で使う既定モデル。
-// TODO(§11): モデル選定は未決定。設定（環境変数）から注入できるようにする。
+// DefaultModel は Options.Model が未設定のときに使う既定モデル。
+// api 側で OFFICE_LLM_MODEL から Options.Model へ注入できる。
+//
+// TODO(§11): モデル選定は未決定。既定値は暫定。
 const DefaultModel = "claude-3-5-haiku-latest"
 
 // レビュー結果に応じた関係値（affinity/trust）の増減量。
@@ -86,6 +90,8 @@ type Employee struct {
 type Options struct {
 	MaxTurns    int           // 1 タスクあたりの最大ターン数。既定 8
 	TokenBudget int           // 1 タスクあたりの入出力合計トークン上限。既定 20000
+	Model       string        // LLM モデル名。空なら DefaultModel
+	MaxTokens   int           // 1 リクエストの最大出力トークン。0 以下なら既定 1024
 	Channel     string        // 報告先チャンネル。既定 "#会議室"
 	TaskTimeout time.Duration // worker の実行結果を待つ上限。既定 5 分
 	Logger      *slog.Logger  // 既定 slog.Default()
@@ -140,6 +146,12 @@ func normalizeOptions(opts Options) Options {
 	}
 	if opts.TokenBudget <= 0 {
 		opts.TokenBudget = defaultTokenBudget
+	}
+	if strings.TrimSpace(opts.Model) == "" {
+		opts.Model = DefaultModel
+	}
+	if opts.MaxTokens <= 0 {
+		opts.MaxTokens = defaultMaxTokens
 	}
 	if strings.TrimSpace(opts.Channel) == "" {
 		opts.Channel = defaultChannel
@@ -286,9 +298,10 @@ func (m *Manager) handleTask(ctx context.Context, t Task) {
 	}
 
 	req := llm.Request{
-		Model:    DefaultModel,
-		System:   m.systemPrompt(),
-		Messages: []llm.Message{{Role: "user", Content: taskPrompt(t)}},
+		Model:     m.opts.Model,
+		System:    m.systemPrompt(),
+		Messages:  []llm.Message{{Role: "user", Content: taskPrompt(t)}},
+		MaxTokens: m.opts.MaxTokens,
 	}
 
 	maxTurns := m.opts.MaxTurns

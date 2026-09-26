@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -198,7 +200,8 @@ func TestAnthropicChatErrorBodyTruncated(t *testing.T) {
 	long := strings.Repeat("あ", maxErrorBodyRunes+100)
 	srv, _ := newTestServer(t, http.StatusInternalServerError, long)
 
-	client := NewAnthropic("k", srv.URL)
+	// 500 はリトライ対象なので、切り詰め検証を高速化するため無効化する。
+	client := NewAnthropic("k", srv.URL, WithMaxRetries(0))
 	_, err := client.Chat(context.Background(), Request{Model: "m"})
 	if err == nil {
 		t.Fatal("エラーを返すべきです")
@@ -231,5 +234,242 @@ func TestAnthropicChatContextCanceled(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		t.Errorf("context のエラーをラップすべきです: %v", err)
+	}
+}
+
+// okBody は 200 応答の最小 JSON。
+const okBody = `{
+	"model": "m",
+	"content": [{"type": "text", "text": "ok"}],
+	"usage": {"input_tokens": 1, "output_tokens": 1},
+	"stop_reason": "end_turn"
+}`
+
+func TestAnthropicDefaults(t *testing.T) {
+	client := NewAnthropic("k", "")
+	if client.baseURL != defaultBaseURL {
+		t.Errorf("baseURL = %q, want %q", client.baseURL, defaultBaseURL)
+	}
+	if client.httpClient.Timeout != defaultHTTPTimeout {
+		t.Errorf("timeout = %v, want %v", client.httpClient.Timeout, defaultHTTPTimeout)
+	}
+	if client.maxRetries != defaultMaxRetries {
+		t.Errorf("maxRetries = %d, want %d", client.maxRetries, defaultMaxRetries)
+	}
+	if client.retryBaseDelay != defaultRetryBaseDelay {
+		t.Errorf("retryBaseDelay = %v, want %v", client.retryBaseDelay, defaultRetryBaseDelay)
+	}
+}
+
+func TestAnthropicRetriesOn429ThenSucceeds(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"slow down"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(okBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewAnthropic("k", srv.URL, WithRetryBaseDelay(time.Millisecond))
+	resp, err := client.Chat(context.Background(), Request{Model: "m"})
+	if err != nil {
+		t.Fatalf("429 後の成功を期待しましたがエラー: %v", err)
+	}
+	if resp.Text != "ok" {
+		t.Errorf("Text = %q, want ok", resp.Text)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("サーバが受けたリクエスト数 = %d, want 2", got)
+	}
+}
+
+func TestAnthropicExhaustsRetries(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"type":"api_error","message":"boom"}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	// 初回 + maxRetries(2) = 3 回で打ち切る。
+	client := NewAnthropic("k", srv.URL, WithMaxRetries(2), WithRetryBaseDelay(time.Millisecond))
+	_, err := client.Chat(context.Background(), Request{Model: "m"})
+	if err == nil {
+		t.Fatal("リトライを使い切ったらエラーを返すべきです")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("エラーにステータスコードが含まれていません: %v", err)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("サーバが受けたリクエスト数 = %d, want 3", got)
+	}
+}
+
+func TestAnthropicDoesNotRetryClientErrors(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var calls atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("content-type", "application/json")
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"no"}}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			client := NewAnthropic("k", srv.URL, WithRetryBaseDelay(time.Millisecond))
+			_, err := client.Chat(context.Background(), Request{Model: "m"})
+			if err == nil {
+				t.Fatalf("status %d ではエラーを返すべきです", status)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Errorf("status %d: リクエスト数 = %d, want 1（リトライ禁止）", status, got)
+			}
+		})
+	}
+}
+
+func TestAnthropicHonorsRetryAfter(t *testing.T) {
+	// 1 回目は 503 + Retry-After: 1（秒）。
+	// バックオフ基準は 1ms なので、Retry-After を無視していれば 1ms 後に
+	// リトライして 2 回目で成功してしまう。ctx を 200ms で切ることで、
+	// 「実際に 200ms 以上待機している」= Retry-After を尊重していることを検証する。
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"type":"overloaded_error","message":"busy"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(okBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewAnthropic("k", srv.URL, WithRetryBaseDelay(time.Millisecond))
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := client.Chat(ctx, Request{Model: "m"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Retry-After 待機中に ctx が期限切れになるはずです: err=%v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("サーバが受けたリクエスト数 = %d, want 1（1 秒待ってからリトライするはず）", got)
+	}
+}
+
+func TestAnthropicRetryAfterOverridesBackoff(t *testing.T) {
+	// Retry-After: 0 は「即時リトライ」。バックオフ基準を 1 分にしても
+	// 即座に再試行・成功することを確認する（Retry-After 優先の検証）。
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"slow down"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(okBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewAnthropic("k", srv.URL, WithRetryBaseDelay(time.Minute))
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if _, err := client.Chat(ctx, Request{Model: "m"}); err != nil {
+		t.Fatalf("Retry-After: 0 は即時リトライするはずです: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("サーバが受けたリクエスト数 = %d, want 2", got)
+	}
+}
+
+func TestAnthropicTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(okBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewAnthropic("k", srv.URL,
+		WithTimeout(50*time.Millisecond),
+		WithMaxRetries(0),
+		WithRetryBaseDelay(time.Millisecond),
+	)
+	if _, err := client.Chat(context.Background(), Request{Model: "m"}); err == nil {
+		t.Fatal("タイムアウトではエラーを返すべきです")
+	}
+}
+
+func TestAnthropicStringOmitsAPIKey(t *testing.T) {
+	const key = "sk-ant-super-secret-key"
+	client := NewAnthropic(key, "https://example.test", WithTimeout(3*time.Second), WithMaxRetries(5))
+	s := client.String()
+	if strings.Contains(s, key) {
+		t.Fatalf("String() に API キーが含まれています: %q", s)
+	}
+	for _, want := range []string{"anthropic(", "baseURL=https://example.test", "timeout=3s", "maxRetries=5"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("String() に %q が含まれていません: %q", want, s)
+		}
+	}
+}
+
+func TestAnthropicModelFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// model フィールドを省略する。
+		_, _ = w.Write([]byte(`{
+			"content": [{"type": "text", "text": "ok"}],
+			"usage": {"input_tokens": 1, "output_tokens": 1},
+			"stop_reason": "end_turn"
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewAnthropic("k", srv.URL, WithMaxRetries(0))
+	resp, err := client.Chat(context.Background(), Request{Model: "claude-requested"})
+	if err != nil {
+		t.Fatalf("Chat がエラーを返しました: %v", err)
+	}
+	if resp.Model != "claude-requested" {
+		t.Errorf("Model = %q, want リクエスト時の claude-requested", resp.Model)
+	}
+}
+
+func TestAnthropicErrorHints(t *testing.T) {
+	cases := []struct {
+		status int
+		hint   string
+	}{
+		{http.StatusUnauthorized, "API キーを確認してください"},
+		{http.StatusNotFound, "モデル名を確認してください"},
+	}
+	for _, tc := range cases {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			srv, _ := newTestServer(t, tc.status, `{"error":{"message":"x"}}`)
+			client := NewAnthropic("k", srv.URL, WithMaxRetries(0))
+			_, err := client.Chat(context.Background(), Request{Model: "m"})
+			if err == nil {
+				t.Fatalf("status %d ではエラーを返すべきです", tc.status)
+			}
+			if !strings.Contains(err.Error(), tc.hint) {
+				t.Errorf("エラーに対処ヒント %q が含まれていません: %v", tc.hint, err)
+			}
+		})
 	}
 }

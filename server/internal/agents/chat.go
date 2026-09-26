@@ -118,9 +118,10 @@ func (c *ChatAgent) handlePrompt(ctx context.Context, prompt string) {
 	}
 
 	req := llm.Request{
-		Model:    DefaultModel,
-		System:   c.systemPrompt(),
-		Messages: []llm.Message{{Role: "user", Content: chatPrompt(prompt)}},
+		Model:     c.opts.Model,
+		System:    c.systemPrompt(),
+		Messages:  []llm.Message{{Role: "user", Content: chatPrompt(prompt)}},
+		MaxTokens: c.opts.MaxTokens,
 	}
 
 	maxTurns := c.opts.MaxTurns

@@ -4,7 +4,8 @@
 // 差し替え可能にするため Client インターフェースを定義し、テストでは
 // MockClient を用いて実際のネットワークアクセスを行わない（§10 テスト方針）。
 //
-// Phase 1.2 では Anthropic Messages API の実装のみを提供する。
+// 実装: Anthropic Messages API（anthropic.go）と、OpenAI 互換 API を提供する
+// DeepSeek（deepseek.go）。共通のオプションとリトライ処理は options.go / retry.go に置く。
 package llm
 
 import (

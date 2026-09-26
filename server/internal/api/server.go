@@ -21,6 +21,7 @@ import (
 	"github.com/yukirawa/ai-office/server/internal/config"
 	"github.com/yukirawa/ai-office/server/internal/economy"
 	"github.com/yukirawa/ai-office/server/internal/gh"
+	"github.com/yukirawa/ai-office/server/internal/llm"
 	"github.com/yukirawa/ai-office/server/internal/presence"
 	"github.com/yukirawa/ai-office/server/internal/store"
 )
@@ -33,7 +34,9 @@ type Deps struct {
 	Economy  *economy.Service
 	// Manager は mgr エージェント。SetManager で後から差し込める（循環依存回避のため）。
 	Manager *agents.Manager
-	Logger  *slog.Logger
+	// LLM はエージェントが使う LLM クライアント。SetLLM でも後から差し替えられる。
+	LLM    llm.Client
+	Logger *slog.Logger
 }
 
 // Server は HTTP/WS サーバの状態を保持する。
@@ -51,6 +54,7 @@ type Server struct {
 	chat        *agents.ChatAgent
 	agentStates map[string]string
 	ghClient    gh.Client
+	llmClient   llm.Client
 
 	// waiters は task_result を待つ DevAgent への受け渡し（tasks.go）。
 	waitersMu sync.Mutex
@@ -72,6 +76,7 @@ func New(d Deps) *Server {
 		hub:         newHub(),
 		manager:     d.Manager,
 		agentStates: make(map[string]string),
+		llmClient:   d.LLM,
 		waiters:     make(map[string]*waiter),
 	}
 	return s
@@ -236,6 +241,10 @@ func (s *Server) Handler() http.Handler {
 
 	// オーナーの発言に chat 役が応答する（Phase 4.3）
 	r.Post("/api/chat", s.handleChat)
+
+	// LLM 診断（実 API キー/モデルの確認用）
+	r.Get("/api/llm", s.handleLLMInfo)
+	r.Post("/api/llm/ping", s.handleLLMPing)
 
 	// §4.3 /webhook/github
 	// Phase 3: 署名検証してタスク化する。secret は cfg（env GITHUB_WEBHOOK_SECRET）。

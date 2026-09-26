@@ -44,33 +44,62 @@ cd server && go build ./...
 cd client && cargo build --workspace
 ```
 
-## 動かす（Phase 0: TUI で出退勤を体感）
+## 設定（.env）
 
-いちばん手軽なのは対話デモ。`officed` と worker 2 体（`dev_m` / `dev_f`）を起動し、
-そのまま TUI を表示する。
+リポジトリ直下の `.env` に設定をまとめられる（`officed` が起動時に自動で読み込む。既に export
+した環境変数が優先される）。
+
+```sh
+cp .env.example .env
+# 実キーを使うなら OFFICE_LLM_PROVIDER=anthropic と ANTHROPIC_API_KEY を設定
+```
+
+## 2ターミナルで動かす（デプロイ相当）
+
+実デプロイは「サーバーは常時稼働、クライアントは必要な時だけ接続」する構成なので、
+ターミナルを 2 つ使うのが基本形。
+
+ターミナル1（サーバー側 = 頭脳・記憶）:
+
+```sh
+start-server
+```
+
+ターミナル2（クライアント側 = 手足・実行）:
+
+```sh
+start-client
+# 別ホストの鯖へ繋ぐ場合: OFFICE_SERVER_URL=ws://<tailscale-ip>:8787/ws start-client
+```
+
+- `start-server` / `start-client` は `~/.local/bin` に入れたショートカット（実体はリポジトリ直下の
+  `./start-server` / `./start-client` → `scripts/*.sh`）。PATH に無ければ `./start-server` を使う。
+- サーバーはルートの `.env` を自動で読む。クライアント側も `.env` を読む（既存 env が優先）。
+- TUI は `q` / `Ctrl-C` で終了。起動した worker（dev_m / dev_f）は終了時に自動停止する。
+- ログ: サーバーは画面、クライアントは `client/data/run/*.log`。
+
+## 1ターミナルで手軽に試す
 
 ```sh
 sh scripts/demo.sh
 # OFFICE_PORT=9000 sh scripts/demo.sh   # ポートを変える場合
 ```
 
-TUI のキー操作は `q`（または `Ctrl-C`）で終了。終了すると worker と `officed` も止まる。
-TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: `mgr`）と下部の `> _` を表示する。
+`officed` と worker 2 体を起動して TUI を表示する。終了すると全部止まる。
+TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: `mgr`）と下部の `> _`。
 
-手動で起動する場合:
+## 手動で起動する
 
 ```sh
-# 1) サーバー
-cd server
-OFFICE_LLM_PROVIDER=mock go run ./cmd/officed
+# ターミナル1: サーバー
+cd server && go run ./cmd/officed
 
-# 2) worker（別ターミナル）
+# ターミナル2: worker
 cd client
-OFFICE_EMPLOYEE_ID=dev_m OFFICE_DEVICE_ID=zenbook ./target/debug/worker
+OFFICE_EMPLOYEE_ID=dev_m OFFICE_WORKSPACE="$PWD/data/run/ws/dev_m" ./target/debug/worker
 
-# 3) TUI（別ターミナル）
-cd client
-./target/debug/tui
+# ターミナル3: TUI
+cd client && ./target/debug/tui
 ```
 
 タスクを mgr に投入すると、mgr が計画 → dev エージェントが worker に割当 → worker が実行、
@@ -122,6 +151,52 @@ worker の実行モード:
   ```
 - **雑談 cron（4.4）**: `OFFICE_CHAT_CRON` の間隔で chat 役が `#会議室` に一言投稿する
   （`off` で無効）。
+
+## 実APIキーで動かす（DeepSeek / Anthropic）
+
+既定は `mock`（外部 API を呼ばない）。実キーを使うと mgr / dev / chat が実際に推論する。
+プロバイダは `OFFICE_LLM_PROVIDER=deepseek`（ネイティブ対応）または `anthropic`。
+
+### DeepSeek
+
+```sh
+# .env に書くのが簡単（推奨）:
+#   OFFICE_LLM_PROVIDER=deepseek
+#   DEEPSEEK_API_KEY=sk-xxxxxxxx
+# env や secrets/deepseek.key でも可（gitignore 済み）:
+#   mkdir -p secrets && printf '%s\n' 'sk-xxxxxxxx' > secrets/deepseek.key
+
+# 聴通とモデル確認（サーバ起動不要）
+cd server
+OFFICE_LLM_PROVIDER=deepseek go run ./cmd/officed --llm-check
+OFFICE_LLM_PROVIDER=deepseek go run ./cmd/officed --llm-models
+```
+
+既定モデルは `deepseek-chat`（`OFFICE_LLM_MODEL` 未設定時）。`deepseek-reasoner` も指定可能。
+
+### Anthropic
+
+```sh
+# .env:  OFFICE_LLM_PROVIDER=anthropic / ANTHROPIC_API_KEY=sk-ant-...
+cd server
+OFFICE_LLM_PROVIDER=anthropic go run ./cmd/officed --llm-check
+OFFICE_LLM_PROVIDER=anthropic go run ./cmd/officed --llm-models
+```
+
+### 起動中に確認（共通）
+
+```sh
+curl http://127.0.0.1:8787/api/llm
+curl -X POST http://127.0.0.1:8787/api/llm/ping -H 'Content-Type: application/json' -d '{}'
+```
+
+注意:
+
+- モデル名はプロバイダ側で変わる。`404` なら `--llm-models` で確認して `OFFICE_LLM_MODEL` を設定する
+  （404 のエラーにもその旨ヒントを出します）。
+- `401` のときはキーの設定場所（env / `.env` / `secrets/*.key`）を確認する。
+- タイムアウトは `OFFICE_LLM_TIMEOUT`（既定 120s）、1 リクエストの最大出力は
+  `OFFICE_LLM_MAX_TOKENS`（既定 1024）。429/5xx は自動リトライ（既定 3 回）。
 
 ## GitHub 連携（Phase 3・任意）
 
@@ -235,9 +310,13 @@ curl -X POST http://127.0.0.1:8787/api/chat -H 'Content-Type: application/json' 
 | `OFFICE_PAYROLL_CRON` | `0 9 * * *` | 日割り給与の cron（`@every 5s` も可） |
 | `OFFICE_PAYROLL_TZ` | `Asia/Tokyo` | cron のタイムゾーン |
 | `OFFICE_CHAT_CRON` | `0 * * * *` | 雑談 cron（`off` で無効） |
-| `OFFICE_LLM_PROVIDER` | `mock` | `mock` または `anthropic` |
-| `OFFICE_LLM_MODEL` | `claude-3-5-haiku-latest` | モデル名 |
-| `ANTHROPIC_API_KEY` | （空） | 未設定なら `secrets/anthropic.key` を読む。無ければ mock |
+| `OFFICE_LLM_PROVIDER` | `mock` | `mock` / `deepseek` / `anthropic` |
+| `OFFICE_LLM_MODEL` | プロバイダ既定 | モデル名（deepseek-chat / claude-3-5-haiku-latest） |
+| `OFFICE_LLM_TIMEOUT` | `120s` | 1 リクエストのタイムアウト |
+| `OFFICE_LLM_MAX_TOKENS` | `1024` | 1 リクエストの最大出力トークン |
+| `DEEPSEEK_API_KEY` | （空） | 未設定なら `secrets/deepseek.key` を読む |
+| `OFFICE_DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API のベース URL |
+| `ANTHROPIC_API_KEY` | （空） | 未設定なら `secrets/anthropic.key` を読む |
 | `GITHUB_*` | （空） | 上記「GitHub 連携」を参照 |
 
 クライアント（worker / tui）は `OFFICE_SERVER_URL`（既定 `ws://127.0.0.1:8787/ws`）を使う。
@@ -264,6 +343,8 @@ worker の追加設定:
 | POST | `/api/tasks` | オーナーからのタスク投入（`title`/`description`/`from`/`mode`/`repo`/`base_branch`） |
 | GET | `/api/tasks` | タスク一覧（`?status=&limit=`） |
 | POST | `/api/chat` | オーナーの発言に chat 役が応答 |
+| GET | `/api/llm` | LLM プロバイダ/モデル/設定の表示 |
+| POST | `/api/llm/ping` | LLM へ 1 回だけ問い合わせて疎通確認 |
 | POST | `/webhook/github` | GitHub webhook（署名検証 → タスク化） |
 
 ## 現在のフェーズ
