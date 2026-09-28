@@ -22,6 +22,7 @@ const (
 	defaultPayrollCron      = "0 9 * * *"
 	defaultPayrollTimezone  = "Asia/Tokyo"
 	defaultChatCron         = "0 * * * *"
+	defaultAnswerTimeout    = 3 * time.Minute
 	defaultLLMProvider      = "mock"
 	defaultLLMModel         = "claude-3-5-haiku-latest"
 	defaultLLMTimeout       = 120 * time.Second
@@ -29,8 +30,6 @@ const (
 	defaultAnthropicBaseURL = "https://api.anthropic.com"
 	defaultDeepSeekBaseURL  = "https://api.deepseek.com"
 	defaultDeepSeekModel    = "deepseek-chat"
-	defaultPremiumModel     = "deepseek-reasoner"
-	defaultPremiumPrice     = 100
 	defaultInequalityCron   = "0 * * * *"
 	defaultInequalityThresh = 500
 	defaultMaxAgentTurns    = 8
@@ -72,6 +71,8 @@ type Config struct {
 	PayrollTimezone string
 	// ChatCron は雑談 cron 式（env OFFICE_CHAT_CRON）。"off" で無効（§8 4.4）。
 	ChatCron string
+	// AnswerTimeout はオーナーへの質問の回答を待つ上限（env OFFICE_ANSWER_TIMEOUT、§16）。
+	AnswerTimeout time.Duration
 	// LLMProvider は "mock" または "anthropic"（env OFFICE_LLM_PROVIDER）。
 	LLMProvider string
 	// LLMModel は LLM のモデル名（env OFFICE_LLM_MODEL）。
@@ -114,10 +115,6 @@ type Config struct {
 
 	// ---- Phase 5: 経済・社会 ----
 
-	// PremiumModel は高級モデル購入で使うモデル名（env OFFICE_PREMIUM_MODEL）。
-	PremiumModel string
-	// PremiumModelPrice は高級モデルの購入価格（学）（env OFFICE_PREMIUM_MODEL_PRICE）。
-	PremiumModelPrice int
 	// InequalityCron は格差観察の cron 式（env OFFICE_INEQUALITY_CRON、off で無効）。
 	InequalityCron string
 	// InequalityThreshold は格差アラートを出す残高の差（env OFFICE_INEQUALITY_THRESHOLD）。
@@ -158,11 +155,11 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	premiumPrice, err := intEnv("OFFICE_PREMIUM_MODEL_PRICE", defaultPremiumPrice)
+	inequalityThreshold, err := intEnv("OFFICE_INEQUALITY_THRESHOLD", defaultInequalityThresh)
 	if err != nil {
 		return nil, err
 	}
-	inequalityThreshold, err := intEnv("OFFICE_INEQUALITY_THRESHOLD", defaultInequalityThresh)
+	answerTimeout, err := durationEnv("OFFICE_ANSWER_TIMEOUT", defaultAnswerTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -203,6 +200,7 @@ func Load() (*Config, error) {
 		PayrollCron:          stringEnv("OFFICE_PAYROLL_CRON", defaultPayrollCron),
 		PayrollTimezone:      stringEnv("OFFICE_PAYROLL_TZ", defaultPayrollTimezone),
 		ChatCron:             stringEnv("OFFICE_CHAT_CRON", defaultChatCron),
+		AnswerTimeout:        answerTimeout,
 		LLMProvider:          provider,
 		LLMModel:             model,
 		LLMTimeout:           llmTimeout,
@@ -221,8 +219,6 @@ func Load() (*Config, error) {
 		GitHubWebhookSecret:  os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		GitHubRepo:           strings.TrimSpace(os.Getenv("GITHUB_REPO")),
 		GitHubBaseBranch:     stringEnv("GITHUB_BASE_BRANCH", "main"),
-		PremiumModel:         stringEnv("OFFICE_PREMIUM_MODEL", defaultPremiumModel),
-		PremiumModelPrice:    premiumPrice,
 		InequalityCron:       stringEnv("OFFICE_INEQUALITY_CRON", defaultInequalityCron),
 		InequalityThreshold:  inequalityThreshold,
 	}, nil

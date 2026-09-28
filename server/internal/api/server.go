@@ -7,7 +7,9 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -215,6 +217,13 @@ func (s *Server) snapshot(ctx context.Context) officeStateMsg {
 	return msg
 }
 
+// IsEmployeeOnline は社員が出勤中（online / busy / break）かを返す。
+// mgr の割当でオンラインの dev を優先するために使う（presence が未登録なら false）。
+func (s *Server) IsEmployeeOnline(id string) bool {
+	p, ok := s.presence.Get(id)
+	return ok && p.Status != presence.StatusOffline
+}
+
 // Handler はルーティング済みの http.Handler を返す。
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
@@ -237,7 +246,6 @@ func (s *Server) Handler() http.Handler {
 	// 経済（Phase 5）
 	r.Get("/api/ledger", s.handleLedgerAll)
 	r.Get("/api/ledger/{id}/entries", s.handleLedgerEntries)
-	r.Post("/api/economy/purchase", s.handlePurchase)
 	r.Get("/api/economy/status", s.handleEconomyStatus)
 
 	// 関係値（設計書 §5 の relationships。TUI 右ペイン用の拡張エンドポイント）
@@ -352,6 +360,14 @@ func (s *Server) handleEmployees(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLedger(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if _, err := s.store.Employee(id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSONError(w, http.StatusNotFound, "対象の社員がいません: "+id)
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "社員の取得に失敗しました")
+		return
+	}
 	balance, err := s.economy.Balance(r.Context(), id)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "残高の取得に失敗しました")

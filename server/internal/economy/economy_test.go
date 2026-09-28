@@ -33,7 +33,7 @@ func TestCreditDebitBalance(t *testing.T) {
 	if err := e.Credit(ctx, "dev_m", 500, "月給"); err != nil {
 		t.Fatalf("Credit: %v", err)
 	}
-	if err := e.Debit(ctx, "dev_m", 120, "高級モデル購入"); err != nil {
+	if err := e.Debit(ctx, "dev_m", 120, "備品購入"); err != nil {
 		t.Fatalf("Debit: %v", err)
 	}
 

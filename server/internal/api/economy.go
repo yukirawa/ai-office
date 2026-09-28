@@ -1,41 +1,63 @@
 package api
 
-// economy.go は Phase 5（学の元帳・高級モデル購入・格差の観察）の API。
+// economy.go は Phase 5（学の元帳・格差の観察）の API。
 //
 //   - GET  /api/ledger               全社員の残高
 //   - GET  /api/ledger/:id/entries   元帳履歴
-//   - POST /api/economy/purchase     高級モデルの購入（残高を消費してモデル差し替え）
 //   - GET  /api/economy/status       残高分布（格差の観察）
 //
 // 労働運動トリガー（§8 5.3）は「観察のみ」: 閾値を超えたら通知するだけで、行動は起こさない。
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/go-chi/chi/v5"
 )
 
 // handleLedgerAll は全社員の残高を返す（Phase 5.1）。
+// 元帳の記録が無い社員（残高 0。例: chat）も含めて全社員を返す。
 func (s *Server) handleLedgerAll(w http.ResponseWriter, r *http.Request) {
-	balances, err := s.economy.Balances(r.Context())
+	ctx := r.Context()
+	emps, err := s.store.Employees()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "社員一覧の取得に失敗しました")
+		return
+	}
+	balances, err := s.economy.Balances(ctx)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "残高の取得に失敗しました")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"balances": balances})
+
+	out := make(map[string]int, len(emps))
+	for _, e := range emps {
+		// Balances に無い社員はゼロ値 0 になる。
+		out[e.ID] = balances[e.ID]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"balances": out})
 }
 
 // handleLedgerEntries は指定社員の元帳履歴を返す（Phase 5.1）。
 func (s *Server) handleLedgerEntries(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if _, err := s.store.Employee(id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSONError(w, http.StatusNotFound, "対象の社員がいません: "+id)
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "社員の取得に失敗しました")
+		return
+	}
+
+	// limit は 1..200 に収める。範囲外（負値・0・巨大値）や非数値は既定 50。
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 200 {
 			limit = n
 		}
 	}
@@ -58,71 +80,6 @@ func (s *Server) handleLedgerEntries(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"employee_id": id, "entries": out})
 }
 
-// handlePurchase は高級モデルを購入する（Phase 5.2）。
-// 残高から price を引き、対象エージェントのモデルを実行時に差し替える。
-func (s *Server) handlePurchase(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		EmployeeID string `json:"employee_id"`
-		Model      string `json:"model"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "JSON の解釈に失敗しました")
-		return
-	}
-
-	id := strings.TrimSpace(body.EmployeeID)
-	if id == "" {
-		writeJSONError(w, http.StatusBadRequest, "employee_id は必須です")
-		return
-	}
-	ag := s.employee(id)
-	if ag == nil {
-		writeJSONError(w, http.StatusNotFound, "対象の社員がいません: "+id)
-		return
-	}
-	model := strings.TrimSpace(body.Model)
-	if model == "" {
-		model = s.cfg.PremiumModel
-	}
-	price := s.cfg.PremiumModelPrice
-	if price <= 0 {
-		writeJSONError(w, http.StatusBadRequest, "OFFICE_PREMIUM_MODEL_PRICE が未設定です")
-		return
-	}
-
-	ctx := r.Context()
-	balance, err := s.economy.Balance(ctx, id)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "残高の取得に失敗しました")
-		return
-	}
-	if balance < price {
-		writeJSON(w, http.StatusPaymentRequired, map[string]any{
-			"error": "残高が足りません", "employee_id": id, "balance": balance, "price": price,
-		})
-		return
-	}
-	if err := s.economy.Debit(ctx, id, price, "高級モデル購入: "+model); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "支払いに失敗しました")
-		return
-	}
-	ag.SetModel(model)
-
-	if err := s.Notify(ctx, channelDefault, "system",
-		fmt.Sprintf("%s が高級モデル %s を購入しました（-%d学）", id, model, price)); err != nil {
-		s.log.Warn("購入通知の投稿に失敗しました", "error", err)
-	}
-	s.BroadcastState()
-
-	newBalance, _ := s.economy.Balance(ctx, id)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"employee_id": id,
-		"model":       model,
-		"price":       price,
-		"balance":     newBalance,
-	})
-}
-
 // economyStatus は残高分布の統計（格差の観察用）。
 type economyStatus struct {
 	Balances  map[string]int `json:"balances"`
@@ -140,6 +97,15 @@ func (s *Server) economyStatusSnapshot(ctx context.Context) economyStatus {
 	balances, err := s.economy.Balances(ctx)
 	if err != nil {
 		return st
+	}
+	// /api/ledger と同じ母集団にする: 台帳に行が無い社員（残高 0。例: 日当制の chat）も
+	// 含めて全社員で分布を取る。取得に失敗した場合は台帳のある社員だけで続行する。
+	if emps, err := s.store.Employees(); err == nil {
+		all := make(map[string]int, len(emps))
+		for _, e := range emps {
+			all[e.ID] = balances[e.ID]
+		}
+		balances = all
 	}
 	st.Balances = balances
 

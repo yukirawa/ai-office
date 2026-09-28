@@ -40,9 +40,11 @@ const devLocalInstruction = `あなたは開発担当です。タスクを遂行
 const devRemoteInstruction = `あなたは開発担当です。GitHub へ提出するファイルを JSON で指示してください。形式は {"files":[{"path":"...","content":"..."}]} です。`
 
 // planResult は LLM 応答から抽出した割当内容。local は Actions、remote は Files を使う。
+// Question が入っている場合は「情報不足でオーナーに確認したい」という意思表示（§16）。
 type planResult struct {
-	Actions []Action     `json:"actions"`
-	Files   []RemoteFile `json:"files"`
+	Actions  []Action     `json:"actions"`
+	Files    []RemoteFile `json:"files"`
+	Question string       `json:"question,omitempty"`
 }
 
 // DevAgent は 1 体の開発担当 AI 社員を動かす。1 体 = 1 goroutine を想定する。
@@ -60,13 +62,13 @@ type DevAgent struct {
 	remote     RemoteExecutor
 	reviewer   Reviewer
 
+	// escalator は疑問を mgr 経由でオーナーへ上げる先（mgr を SetEscalator で設定）。
+	escalator Escalator
+
 	inbox chan Task
 
 	mu    sync.RWMutex
 	state string
-
-	// models は実行時に差し替え可能なモデル名を保持する（Phase 5 の高級モデル購入）。
-	models modelState
 }
 
 // NewDevAgent は DevAgent を生成する。Run を別 goroutine で呼ぶまでタスクは処理されない。
@@ -90,19 +92,14 @@ func NewDevAgent(id string, p persona.Persona, client llm.Client, notifier Notif
 		reviewer:   reviewer,
 		inbox:      make(chan Task, inboxCapacity),
 		state:      StateIdle,
-		models:     newModelState(opts.Model),
 	}
 }
 
-// SetModel は実行時に使うモデルを差し替える（Modeler、Phase 5）。
-// 空文字は設定既定（Options.Model、無ければ DefaultModel）へ戻す。
-func (d *DevAgent) SetModel(model string) { d.models.set(model) }
-
-// Model は現在使うモデル名を返す（スレッドセーフ）。
-func (d *DevAgent) Model() string { return d.models.get() }
-
 // ID は社員 ID を返す。
 func (d *DevAgent) ID() string { return d.id }
+
+// SetEscalator は疑問を上げる先（mgr）を設定する。構築後でも呼べる（§16）。
+func (d *DevAgent) SetEscalator(e Escalator) { d.escalator = e }
 
 // State は現在の状態を返す（スレッドセーフ）。
 func (d *DevAgent) State() string {
@@ -241,7 +238,14 @@ func (d *DevAgent) buildAssign(ctx context.Context, t Task) (TaskAssign, string)
 		guard   string
 	)
 	if d.client != nil {
-		actions, files, guard = d.planWithLLM(ctx, t, remote)
+		var question string
+		actions, files, guard, question = d.planWithLLM(ctx, t, remote, "")
+		if strings.TrimSpace(question) != "" {
+			// 情報不足。mgr 経由でオーナーへ確認し、回答を得たらそれを踏まえて計画し直す（§16）。
+			if answer, ok := d.escalate(ctx, t, question); ok {
+				actions, files, guard, _ = d.planWithLLM(ctx, t, remote, answer)
+			}
+		}
 	}
 
 	if remote {
@@ -271,13 +275,34 @@ func (d *DevAgent) buildAssign(ctx context.Context, t Task) (TaskAssign, string)
 	return TaskAssign{TaskID: t.ID, Mode: "local", Title: t.Title, Reason: t.Plan, Actions: actions}, guard
 }
 
+// escalate は担当者の疑問を mgr 経由でオーナーへ上げ、回答を待つ（§16）。
+// 回答が得られない場合は ok=false（呼び先はフォールバックで作業を続ける）。
+func (d *DevAgent) escalate(ctx context.Context, t Task, question string) (string, bool) {
+	if d.escalator == nil {
+		d.logger().Warn("エスカレーション先が未設定のため質問できません", "id", d.id, "task_id", t.ID)
+		return "", false
+	}
+	d.setState(StateThinking)
+	d.notify(ctx, fmt.Sprintf("%s: 確認したい点があるため、mgr 経由でオーナーに質問します。", d.name))
+
+	answer, ok := d.escalator.Escalate(ctx, Question{FromID: d.id, TaskID: t.ID, Text: question})
+	if !ok {
+		d.notify(ctx, "（回答が得られなかったため、ひとまず進めます）")
+		return "", false
+	}
+	d.notify(ctx, "オーナーの回答を受け取りました。反映して作業を続けます。")
+	return answer, true
+}
+
 // planWithLLM は LLM に厳密 JSON を要求し、解析できたら割当内容を返す。
+// 上位が情報不足を意味する JSON（{"question":"..."}）を返した場合は、question にその文言を入れる。
+// extra には前回の質問への回答など、プロンプトに足す追加情報を渡す。
 // 無限ループ防止（最大ターン数・トークン予算・同一結論検出）を mgr と同じ規律で適用する。
-func (d *DevAgent) planWithLLM(ctx context.Context, t Task, remote bool) ([]Action, []RemoteFile, string) {
+func (d *DevAgent) planWithLLM(ctx context.Context, t Task, remote bool, extra string) ([]Action, []RemoteFile, string, string) {
 	req := llm.Request{
-		Model:     d.Model(),
+		Model:     d.opts.Model,
 		System:    d.systemPrompt(remote),
-		Messages:  []llm.Message{{Role: "user", Content: assignPrompt(t, remote)}},
+		Messages:  []llm.Message{{Role: "user", Content: assignPrompt(t, remote, extra)}},
 		MaxTokens: d.opts.MaxTokens,
 	}
 
@@ -287,21 +312,24 @@ func (d *DevAgent) planWithLLM(ctx context.Context, t Task, remote bool) ([]Acti
 
 	for turn := 1; turn <= d.opts.MaxTurns; turn++ {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, ""
+			return nil, nil, "", ""
 		}
 
 		resp, err := d.client.Chat(ctx, req)
 		if err != nil {
 			d.logger().Warn("dev の計画 LLM 呼び出しに失敗しました。フォールバックします",
 				"id", d.id, "task_id", t.ID, "turn", turn, "error", err)
-			return nil, nil, ""
+			return nil, nil, "", ""
 		}
 
 		tokensUsed += resp.InputTokens + resp.OutputTokens
 
 		if parsed, ok := parseAssign(resp.Text); ok {
+			if q := strings.TrimSpace(parsed.Question); q != "" {
+				return nil, nil, "", q
+			}
 			if len(parsed.Actions) > 0 || len(parsed.Files) > 0 {
-				return parsed.Actions, parsed.Files, ""
+				return parsed.Actions, parsed.Files, "", ""
 			}
 		}
 
@@ -336,7 +364,7 @@ func (d *DevAgent) planWithLLM(ctx context.Context, t Task, remote bool) ([]Acti
 			guard = "max_turns"
 		}
 	}
-	return nil, nil, guard
+	return nil, nil, guard, ""
 }
 
 // systemPrompt はペルソナに dev 用の指示と厳密 JSON 要求を足して返す。
@@ -374,7 +402,7 @@ func (d *DevAgent) Converse(ctx context.Context, channel, prompt string) {
 		return
 	}
 
-	text, ok := converseRun(ctx, d.client, d.logger(), d.id, d.Model(), d.converseSystemPrompt(), prompt, d.opts)
+	text, ok := converseRun(ctx, d.client, d.logger(), d.id, d.opts.Model, d.converseSystemPrompt(), prompt, d.opts)
 	if !ok {
 		d.setState(StateIdle)
 		return
@@ -389,7 +417,8 @@ func (d *DevAgent) Converse(ctx context.Context, channel, prompt string) {
 }
 
 // assignPrompt はタスクを LLM に渡すユーザーメッセージに整形する。
-func assignPrompt(t Task, remote bool) string {
+// extra には前回の質問へのオーナーの回答などを差し込む（§16）。
+func assignPrompt(t Task, remote bool, extra string) string {
 	var b strings.Builder
 	b.WriteString("次のタスクを遂行するための JSON を作成してください。\n")
 	if t.ID != "" {
@@ -407,10 +436,14 @@ func assignPrompt(t Task, remote bool) string {
 	if p := strings.TrimSpace(t.Plan); p != "" {
 		fmt.Fprintf(&b, "mgr の計画: %s\n", p)
 	}
+	if e := strings.TrimSpace(extra); e != "" {
+		fmt.Fprintf(&b, "オーナーからの回答: %s\n", e)
+	}
+	b.WriteString("\n情報が足りない場合は {\"question\":\"確認したいこと\"} を返してください。")
 	if remote {
-		b.WriteString("\n{\"files\":[{\"path\":\"...\",\"content\":\"...\"}]} の形式の JSON だけを返してください。")
+		b.WriteString("揃っていれば {\"files\":[{\"path\":\"...\",\"content\":\"...\"}]} の形式の JSON だけを返してください。")
 	} else {
-		b.WriteString("\n{\"actions\":[{\"op\":\"write\",\"path\":\"...\",\"content\":\"...\"}]} の形式の JSON だけを返してください。")
+		b.WriteString("揃っていれば {\"actions\":[{\"op\":\"write\",\"path\":\"...\",\"content\":\"...\"}]} の形式の JSON だけを返してください。")
 	}
 	return b.String()
 }

@@ -89,6 +89,10 @@ chat      雑談・雑用（日雇い）      未定  Zenbook(Ollama) 日当制
 
 初期実装では給与固定、歩合なし。AIが自発的に不公平を訴えたら実装する（創発実験）。
 
+補足: `mgr` と `chat` はサーバー側の goroutine で動く常駐社員で、クライアント接続を持たない。
+presence 上は起動直後から常時在席として登録し（`MarkResident`）、heartbeat が無くても退勤扱いに
+しない（§16.4）。
+
 ---
 
 ## 4. プロトコル仕様（固定）
@@ -347,7 +351,6 @@ Phase 4: キャラクター
 
 Phase 5: 経済・社会
 - 5.1 学の元帳・残高API
-- 5.2 高級モデル購入
 - 5.3 労働運動トリガー（観察のみ）
 
 Phase 6: GUI
@@ -396,7 +399,6 @@ CIは最初は入れない。Phase 2 まで来たら GitHub Actions で go test 
 - chat 役の性別
 - mgr, dev_m, dev_f の具体的な性格設定
 - LLM初期モデル選定（Anthropic Haiku/Sonnet/Opus？）
-- 高級モデル購入の価格設定
 - 労働運動のトリガー閾値
 - 2Dオフィスのタイルセット調達
 - OSS公開するか
@@ -585,16 +587,15 @@ Phase 0 の TUI は read-only だったため、クライアント画面から�
 - `@mgr 本文` / `@dev_m 本文` / `@dev_f 本文` / `@chat 本文` … その社員が 1 往復で応答する。
 - `@all 本文` … 全員が応答する（点呼など）。
 - 宛先なし … chat 役が応答する（従来どおり）。
+- 宛先は本文先頭の `@id`。全角の「＠」・全角スペースや `:`・`：`・`,`・`、` 区切りも正規化して
+  受け付ける（`＠mgr　点呼` / `@mgr、点呼` / `@mgr: 点呼` はいずれも mgr 宛て）。
 - 実装: `agents.Converser`（mgr / dev / chat が実装）を api に登録し、`say` の本文先頭の `@id` で振り分ける。
-  実行時モデル差し替え用に `agents.Modeler`（SetModel/Model）も実装。
 
 ### 16.2 経済 API
 
 - `GET  /api/ledger` 全社員の残高
 - `GET  /api/ledger/:id/entries?limit=` 元帳履歴
-- `POST /api/economy/purchase {employee_id, model?}` 高級モデル購入（残高を消費し、その社員のモデルを実行時差し替え）
 - `GET  /api/economy/status` 残高分布（min/max/spread/alert）
-- 価格は `OFFICE_PREMIUM_MODEL_PRICE`、対象モデルは `OFFICE_PREMIUM_MODEL`。
 - 格差観察 cron（`OFFICE_INEQUALITY_CRON`）: spread が `OFFICE_INEQUALITY_THRESHOLD` 以上なら通知する
   （**観察のみ**で行動はしない。労働運動トリガーはこの観察から将来実装）。
 
@@ -604,3 +605,79 @@ Phase 0 の TUI は read-only だったため、クライアント画面から�
   `OFFICE_SANDBOX`（`bwrap` / `none`）。
 - 接続時の履歴には system の入退室通知を含めない（再起動後の見づらさ対策）。
 - dev エージェントの起動時 `【出勤】` 挨拶は削除（worker の check-in 通知と重複するため）。
+
+### 16.4 実装で確定した裁量（§0 の方針）
+
+- Phase 5.2「高級モデル購入（実行時モデル差し替え）」は全面廃止した。DeepSeek の V4 Flash / V4 Pro
+  が V4.1 Flash（`deepseek-flash`）に統合され、上位モデルという概念が実質無くなったため（元帳・残高・給与・格差観察は存続）。
+- TUI にヘッドレス発言（`--say TEXT`。複数回指定可、`--snapshot` と併用可）を追加した。
+  E2E/自動化から `@宛先` を叩くため（`client/crates/tui/src/main.rs`）。
+- `GET /api/ledger` は台帳に行が無い社員（残高 0。例えば日当制の chat）も含めて
+  全社員を返す。`GET /api/economy/status` も同じ全社員を母集団にし（min/spread に 0 を含む）、
+  `/api/ledger` と対象がずれないようにした。`GET /api/ledger/:id/entries` の `limit` は 1..200 に収め、
+  存在しない社員は `/api/ledger/:id` ともども 404 を返す。
+- `@宛先` は大文字小文字を区別しない（`@MGR` も `@mgr` と同じ）。未知の宛先
+  （`@nobody`）は黙殺せず #会議室 に system 通知（`【宛先不明】@nobody という社員はいません`）を出す。
+  `@` の直後が空白のとき（`@ 本文`）はメンション無し扱いにする。
+- TUI の表示整理: 自分の発言はサーバーから届く `notice` のみで 1 回表示する
+  （送信時のローカルエコーを廃止）。再接続時は `welcome` 受信で会話履歴をクリアし、
+  履歴再送による二重表示を防ぐ。
+- presence に「サーバー常駐社員（`mgr` / `chat`）＝常時在席・Expire 対象外」を追加した。両者は
+  サーバー側の goroutine で動き worker 接続を持たないため、従来は heartbeat が無いまま
+  `OFFICE_HEARTBEAT_TIMEOUT` で退勤表示になり、在席の見た目が実態と食い違っていた。
+  `Registry.MarkResident` で起動時に在席登録し、`Expire` の対象から外すことで解消した。
+  `dev_m` / `dev_f` は従来どおり worker の接続で出勤、切断・timeout で退勤する。
+- `parseMention` は全角の「＠」と全角スペース（`\u3000`）を半角へ正規化し、宛先 ID（英数字と
+  アンダースコア）の直後の区切りとして空白・`:`・`：`・`,`・`、` を読み飛ばすようにした。
+  日本語 IME で全角記号が混入しやすく、`＠mgr　点呼` のような入力が宛先として解釈されず
+  「chat しか応答しない」ように見える問題への対策（§16.1）。
+- mgr の割当は「オンラインの dev を優先（候補を在席中に限定）→ 計画の指名 → 負荷分散」の
+  順になった（`Manager.nextAssignee`）。worker 未接続の dev に割り当てて失敗するのを減らす
+  ため（§16.5）。
+- TUI の入力ルーティング: 保留中の質問（`回答> `）があっても、`@` または `/` で始まる入力は
+  回答に飲み込まず通常会議室発言として送る。`@宛先` やコマンドが回答扱いになり
+  「chat しか応答しない」ように見える問題を避けるためで、保留は解除せずそのまま残す。
+
+### 16.5 質問と回答（エスカレーション）
+
+担当者（dev）が作業中に情報不足で判断できない場合、mgr 経由でオーナーへ質問を上げ、回答を
+受け取ってから作業をやり直す（§0 の裁量拡張。§4.2/§15 の「新しい type の追加は自由」に基づく）。
+
+流れ:
+
+```
+dev --Escalate(Question)--> mgr --AskOwner--> api（保存 + question 配信）
+オーナー --answer--> api --AnswerQuestion--> mgr --Answer--> Escalate の戻り値 --> dev
+```
+
+wire（§4.2 / §15 の type 拡張）:
+
+- Server → Client `question`:
+  ```json
+  {"type":"question","id":"uuid","from":"dev_m","text":"...","task_id":"...","ts":"..."}
+  ```
+- Client → Server `answer`:
+  ```json
+  {"type":"answer","question_id":"uuid","text":"..."}
+  ```
+
+実装:
+
+- `agents.Question`（ID / FromID / TaskID / Text）。`agents.Escalator`（`Escalate(ctx, Question) (string, bool)`。
+  `Manager` が実装）。`agents.OwnerChannel`（`AskOwner(ctx, Question) error`。api が実装）。
+- mgr 側: `Manager.Escalate` が質問 ID を採番し、回答受け渡しチャネルを登録して `AskOwner` で配信、
+  回答またはタイムアウトまで待つ。`Manager.Answer` が `answer` を待機中の `Escalate` へ渡す。
+  「管理職を通す」ため、質問は mgr 名義で `#会議室` に保存・配信する。
+- TUI: `question` を受けると `#会議室` に `dev_m（質問）: ...` と表示し、未回答の間は入力プロンプトを
+  `回答> ` にする（`Enter` で回答送信。`/say` は通常発言、`/skip`・`/cancel` は保留解除）。
+- 上限: `OFFICE_ANSWER_TIMEOUT`（既定 `3m`）。回答が得られない場合は ok=false で、担当者は
+  フォールバックして作業を続ける。
+
+方針:
+
+- オーナー（TUI 等）が未接続のときは質問せず即フォールバックする（`AskOwner` がエラーを返す）。
+  長時間ブロックしてタスクが滞留するのを避けるため。
+- mgr の割当は、オンライン（在席中）の dev を優先して候補を絞り、計画文で担当（`dev_m` /
+  `dev_f`）を名指ししていればそれを選び、無ければこれまでの担当件数が少ない方へ割り当てる
+  （`Manager.nextAssignee`。旧ラウンドロビン固定を置換）。worker 未接続の dev に割り当てて
+  失敗するのを減らすため、オンライン優先を先に見る（presence 未登録なら従来どおり全員を候補にする）。

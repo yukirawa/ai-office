@@ -1,10 +1,8 @@
 package agents
 
-// converse_test.go は Converser / Modeler（Agent）の共通挙動を検証する。
+// converse_test.go は Converser（Agent）の共通挙動を検証する。
 //
 // - mgr / dev / chat の Converse が 1 件の通知を投稿する
-// - SetModel で実行時にモデルを差し替えられ、SetModel("") で既定へ戻る
-// - タスク経路（mgr の計画 / dev の計画）も現在のモデルを読む
 // - DevAgent.Run が起動時の【出勤】通知を出さない（重複解消の回帰防止）
 
 import (
@@ -119,132 +117,6 @@ func TestConverseEmptyChannelUsesDefault(t *testing.T) {
 			}
 		})
 	}
-}
-
-// SetModel は実行時のモデルを差し替え、空文字で設定既定へ戻す。
-// Converse がその都度 Model() を読むことを検証する。
-func TestSetModelSwapsAndResets(t *testing.T) {
-	models := []struct {
-		name        string
-		opts        Options
-		wantDefault string
-	}{
-		{name: "configured", opts: Options{Model: "base-model"}, wantDefault: "base-model"},
-		{name: "fallback_default", opts: Options{}, wantDefault: DefaultModel},
-	}
-	for _, tc := range agentCases() {
-		for _, mc := range models {
-			t.Run(tc.name+"/"+mc.name, func(t *testing.T) {
-				notifier := newRecordingNotifier()
-				client := llm.NewMock("はい", "いいえ")
-				a := tc.factory(notifier, client, mc.opts)
-
-				if got := a.Model(); got != mc.wantDefault {
-					t.Errorf("初期 Model() = %q, want %q", got, mc.wantDefault)
-				}
-
-				a.SetModel("premium-x")
-				if got := a.Model(); got != "premium-x" {
-					t.Errorf("SetModel(\"premium-x\") 後 Model() = %q, want premium-x", got)
-				}
-				a.Converse(context.Background(), "#会議室", "ひとつめ")
-
-				a.SetModel("")
-				if got := a.Model(); got != mc.wantDefault {
-					t.Errorf("SetModel(\"\") 後 Model() = %q, want %q", got, mc.wantDefault)
-				}
-				a.Converse(context.Background(), "#会議室", "ふたつめ")
-
-				reqs := client.Requests()
-				if len(reqs) != 2 {
-					t.Fatalf("LLM 呼び出し回数 = %d, want 2", len(reqs))
-				}
-				if got := reqs[0].Model; got != "premium-x" {
-					t.Errorf("1 回目の Model = %q, want premium-x", got)
-				}
-				if got := reqs[1].Model; got != mc.wantDefault {
-					t.Errorf("2 回目の Model = %q, want %q", got, mc.wantDefault)
-				}
-			})
-		}
-	}
-}
-
-// タスク経路（mgr の計画 / dev の計画）も現在のモデルを読むことを検証する。
-func TestSetModelAffectsTaskRequest(t *testing.T) {
-	t.Run("mgr", func(t *testing.T) {
-		notifier := newRecordingNotifier()
-		client := llm.NewMock("計画A", "計画B")
-		mgr := NewManager("mgr", persona.Persona{Name: "mgr"}, client, notifier, Options{})
-		mgr.SetModel("premium-mgr")
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		go mgr.Run(ctx)
-
-		if !mgr.Post(Task{ID: "t1", Title: "x", From: "owner"}) {
-			t.Fatal("Post が false")
-		}
-		if !waitFor(t, 2*time.Second, func() bool { return len(client.Requests()) >= 1 }) {
-			t.Fatal("1 件目の LLM 呼び出しがありません")
-		}
-
-		mgr.SetModel("")
-		if !mgr.Post(Task{ID: "t2", Title: "y", From: "owner"}) {
-			t.Fatal("Post が false")
-		}
-		if !waitFor(t, 2*time.Second, func() bool { return len(client.Requests()) >= 2 }) {
-			t.Fatal("2 件目の LLM 呼び出しがありません")
-		}
-
-		reqs := client.Requests()
-		if got := reqs[0].Model; got != "premium-mgr" {
-			t.Errorf("1 件目の Model = %q, want premium-mgr", got)
-		}
-		if got := reqs[1].Model; got != DefaultModel {
-			t.Errorf("2 件目の Model = %q, want %q", got, DefaultModel)
-		}
-	})
-
-	t.Run("dev", func(t *testing.T) {
-		notifier := newRecordingNotifier()
-		client := llm.NewMock() // 既定の散文 → フォールバック、1 タスク 1 呼び出し
-		dispatcher := &fakeDispatcher{awaitResult: Result{TaskID: "t", Status: "done", Summary: "ok"}}
-		reviewer := &fakeReviewer{}
-		dev := NewDevAgent("dev", persona.Persona{Name: "dev"}, client, notifier,
-			dispatcher, nil, nil, reviewer, Options{})
-		dev.SetModel("premium-dev")
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		go dev.Run(ctx)
-
-		if !dev.Post(Task{ID: "t1", Title: "x", Plan: "p"}) {
-			t.Fatal("Post が false")
-		}
-		if !waitFor(t, 2*time.Second, func() bool { return reviewer.count() == 1 }) {
-			t.Fatal("1 件目のレビューがありません")
-		}
-
-		dev.SetModel("")
-		if !dev.Post(Task{ID: "t2", Title: "y", Plan: "p"}) {
-			t.Fatal("Post が false")
-		}
-		if !waitFor(t, 2*time.Second, func() bool { return reviewer.count() == 2 }) {
-			t.Fatal("2 件目のレビューがありません")
-		}
-
-		reqs := client.Requests()
-		if len(reqs) < 2 {
-			t.Fatalf("LLM 呼び出し回数 = %d, want >= 2", len(reqs))
-		}
-		if got := reqs[0].Model; got != "premium-dev" {
-			t.Errorf("1 件目の Model = %q, want premium-dev", got)
-		}
-		if got := reqs[1].Model; got != DefaultModel {
-			t.Errorf("2 件目の Model = %q, want %q", got, DefaultModel)
-		}
-	})
 }
 
 // LLM エラー時は panic せず、投稿もしない。

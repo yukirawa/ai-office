@@ -37,6 +37,7 @@ OFFICE_ADDR="127.0.0.1:${PORT}" \
 OFFICE_LLM_PROVIDER="mock" \
 OFFICE_PAYROLL_CRON="@every 5s" \
 OFFICE_CHAT_CRON="@every 5s" \
+OFFICE_INEQUALITY_THRESHOLD=1 \
 "${OUT}/officed" > "${OUT}/server.log" 2>&1 &
 SRV_PID=$!
 sleep 1
@@ -97,6 +98,31 @@ echo "dev_m: $(curl -fsS "${HTTP}/api/ledger/dev_m")"
 echo "== TUI snapshot (給与支給後) =="
 OFFICE_SERVER_URL="${BASE}" "${ROOT}/client/target/debug/tui" --snapshot
 
+# ---- Phase 5: 経済・社会（学の元帳・格差の観察） ----
+# OFFICE_INEQUALITY_THRESHOLD=1 なので、役割ごとの日割り額の差で status はすぐ alert になる。
+
+echo "== Phase 5: @all で点呼（tui --say。mgr/dev_m/dev_f/chat が #会議室 に応答） =="
+OFFICE_SERVER_URL="${BASE}" "${ROOT}/client/target/debug/tui" --say "@all 点呼です"
+echo
+sleep 3
+
+echo "== Phase 5: 未知の宛先 @nobody（#会議室 に「宛先不明」の system 通知） =="
+OFFICE_SERVER_URL="${BASE}" "${ROOT}/client/target/debug/tui" --say "@nobody やあ"
+echo
+sleep 2
+
+echo "== Phase 5: say の宛先（server.log を確認。target=all / target=nobody） =="
+grep -a 'say を受信' "${OUT}/server.log" | tail -n 4 || true
+
+echo "== Phase 5.1: GET /api/ledger（全社員。残高 0 の chat も含む） =="
+curl -fsS "${HTTP}/api/ledger"; echo
+
+echo "== Phase 5.1: GET /api/ledger/mgr/entries?limit=5（mgr の元帳履歴） =="
+curl -fsS "${HTTP}/api/ledger/mgr/entries?limit=5"; echo
+
+echo "== Phase 5.3: GET /api/economy/status（残高分布・格差の観察） =="
+curl -fsS "${HTTP}/api/economy/status"; echo
+
 echo "== stop workers (bye 送信 -> 退勤) =="
 kill "${W1_PID}" 2>/dev/null || true
 kill "${W2_PID}" 2>/dev/null || true
@@ -114,6 +140,13 @@ tail -n 40 "${OUT}/server.log"
 echo
 echo "== dev_m.log (tail) =="
 tail -n 20 "${OUT}/dev_m.log"
+
+echo
+echo "== Phase 5 サマリ（経済・社会） =="
+echo "say target=all   : $(grep -ac 'target=all' "${OUT}/server.log" || true) 件"
+echo "say target=nobody: $(grep -ac 'target=nobody' "${OUT}/server.log" || true) 件"
+echo "ledger           : $(curl -fsS "${HTTP}/api/ledger")"
+echo "economy status   : $(curl -fsS "${HTTP}/api/economy/status")"
 
 echo
 echo "SMOKE OK"

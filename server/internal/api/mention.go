@@ -5,6 +5,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -28,24 +29,56 @@ func (s *Server) employee(id string) agents.Agent {
 	return s.employees[id]
 }
 
+// mentionNormalizer は全角の「＠」と全角スペースを半角へ寄せる。
+// 日本語 IME では全角の「＠」や「　」が混ざりやすく、そのままだと宛先として
+// 解釈されず「chat しか応答しない」ように見えるため、先に正規化する。
+var mentionNormalizer = strings.NewReplacer("＠", "@", "\u3000", " ")
+
+// mentionSeparators は宛先 ID の直後に来る区切り文字として読み飛ばす文字集合。
+const mentionSeparators = " \t\r\n:：,、"
+
 // parseMention は本文先頭の "@id" を解釈する。
-// 例: "@mgr 点呼" -> ("mgr", "点呼")。メンションが無ければ ("", 本文)。
+// id は英数字とアンダースコアの連続で、直後の区切り（空白・":"・"、"など）までを宛先、
+// 残りを本文とする。全角の「＠」「　」は半角に正規化する。
+// 例: "@mgr 点呼" -> ("mgr", "点呼") / "＠mgr　点呼" -> ("mgr", "点呼") /
+//
+//	"@mgr: 点呼" -> ("mgr", "点呼")。メンションが無ければ ("", 本文)。
 func parseMention(text string) (target, body string) {
-	t := strings.TrimSpace(text)
+	t := strings.TrimSpace(mentionNormalizer.Replace(text))
 	if !strings.HasPrefix(t, "@") {
 		return "", t
 	}
 	rest := t[1:]
-	if i := strings.IndexAny(rest, " \t\r\n"); i >= 0 {
-		return strings.TrimSpace(rest[:i]), strings.TrimSpace(rest[i+1:])
+	if rest == "" {
+		return "", ""
 	}
-	return strings.TrimSpace(rest), ""
+	i := 0
+	for i < len(rest) && isMentionIDChar(rest[i]) {
+		i++
+	}
+	if i == 0 {
+		// "@ だけ" のように @ の直後が ID でない場合はメンション無し扱いとし、本文全体を返す。
+		return "", t
+	}
+	return rest[:i], strings.TrimSpace(strings.TrimLeft(rest[i:], mentionSeparators))
+}
+
+// isMentionIDChar は宛先 ID に使える ASCII 文字かを返す。
+func isMentionIDChar(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_':
+		return true
+	default:
+		return false
+	}
 }
 
 // dispatchMention は @宛先に応じてエージェントへ会話を投げる（ノンブロッキング）。
 // target が空なら chat 役に渡す（メンション無しの既定挙動）。
 func (s *Server) dispatchMention(channel, target, body string) {
-	switch strings.ToLower(strings.TrimSpace(target)) {
+	// @mgr と @MGR が同じ結果になるよう、判定と lookup の双方で小文字化した id を使う。
+	id := strings.ToLower(strings.TrimSpace(target))
+	switch id {
 	case "":
 		if chat := s.chatAgent(); chat != nil {
 			chat.Post(body)
@@ -57,8 +90,11 @@ func (s *Server) dispatchMention(channel, target, body string) {
 		}
 		s.forEachAgent(func(_ string, ag agents.Agent) { s.converseAsync(ag, channel, prompt) })
 	default:
-		ag := s.employee(strings.TrimSpace(target))
+		ag := s.employee(id)
 		if ag == nil {
+			// 未知の宛先は黙って捨てず、#会議室 に system 通知で可視化する。
+			// 通知文にはユーザー入力そのままの宛先（@ は付けない）を含める。
+			s.notifyUnknownTarget(channel, strings.TrimSpace(target))
 			return
 		}
 		prompt := body
@@ -66,6 +102,15 @@ func (s *Server) dispatchMention(channel, target, body string) {
 			prompt = "呼びかけに一言返してください。"
 		}
 		s.converseAsync(ag, channel, prompt)
+	}
+}
+
+// notifyUnknownTarget は解決できなかった @宛先を #会議室 に system 通知として投稿する。
+// 送信者にエラーを返す経路が無いため、会話の可視フィードバックとして残す。
+func (s *Server) notifyUnknownTarget(channel, target string) {
+	text := fmt.Sprintf("【宛先不明】@%s という社員はいません", target)
+	if err := s.Notify(context.Background(), channel, "system", text); err != nil {
+		s.log.Warn("宛先不明の通知に失敗しました", "channel", channel, "target", target, "error", err)
 	}
 }
 

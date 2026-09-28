@@ -102,6 +102,13 @@ func (h *hub) broadcast(v any) {
 	}
 }
 
+// hasClients は接続中のクライアントが 1 つ以上あるかを返す。
+func (h *hub) hasClients() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients) > 0
+}
+
 // byEmployee は指定社員として接続中のクライアントを返す（observer は対象外）。
 func (h *hub) byEmployee(employeeID string) *client {
 	h.mu.RLock()
@@ -394,6 +401,24 @@ func (s *Server) readLoop(ctx context.Context, cl *client) string {
 				continue
 			}
 			s.log.Info("task を受け付けました", "task_id", id, "employee_id", cl.employeeID)
+		case "answer":
+			var am answerMsg
+			if err := json.Unmarshal(data, &am); err != nil {
+				s.log.Warn("answer の解釈に失敗しました", "employee_id", cl.employeeID, "error", err)
+				continue
+			}
+			text := strings.TrimSpace(am.Text)
+			if text == "" {
+				s.sendError(cl, "invalid_answer", "text が空です")
+				continue
+			}
+			qid := strings.TrimSpace(am.QuestionID)
+			// 回答を #会議室 に投稿して可視化する（from は送信者 = 通常 owner）。
+			if err := s.Notify(ctx, channelDefault, cl.employeeID, "【回答】"+text); err != nil {
+				s.log.Warn("回答の投稿に失敗しました", "employee_id", cl.employeeID, "error", err)
+			}
+			s.AnswerQuestion(qid, text)
+			s.log.Info("answer を受信しました", "employee_id", cl.employeeID, "question_id", qid)
 		case "hello":
 			s.sendError(cl, "duplicate_hello", "hello は接続時に 1 回だけ送ってください")
 		default:

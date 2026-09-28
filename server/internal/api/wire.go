@@ -149,3 +149,21 @@ type taskMsg struct {
 	Repo        string `json:"repo"`
 	BaseBranch  string `json:"base_branch"`
 }
+
+// questionMsg は担当者（dev）の疑問を mgr 経由でオーナーへ送る（§16 エスカレーション）。
+// クライアント（TUI）はこれを質問として表示し、回答を answer で返す。
+type questionMsg struct {
+	Type   string `json:"type"`
+	ID     string `json:"id"`
+	From   string `json:"from"`
+	Text   string `json:"text"`
+	TaskID string `json:"task_id"`
+	TS     string `json:"ts"`
+}
+
+// answerMsg はオーナーからの回答（§16）。question_id で質問を特定する。
+type answerMsg struct {
+	Type       string `json:"type"`
+	QuestionID string `json:"question_id"`
+	Text       string `json:"text"`
+}

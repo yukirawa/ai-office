@@ -33,6 +33,9 @@ type Employee struct {
 type Registry struct {
 	mu        sync.RWMutex
 	employees map[string]*Employee
+	// residents はサーバー常駐の社員（mgr / chat）。heartbeat を送らないため
+	// Expire の対象から外す（設計書 §3 の「鰯常駐」社員）。
+	residents map[string]struct{}
 	// now は現在時刻を返す関数。テストで差し替えられるようにフィールド化している。
 	now func() time.Time
 }
@@ -41,8 +44,43 @@ type Registry struct {
 func NewRegistry() *Registry {
 	return &Registry{
 		employees: make(map[string]*Employee),
+		residents: make(map[string]struct{}),
 		now:       time.Now,
 	}
+}
+
+// MarkResident はサーバー常駐の社員（mgr / chat）を在席として登録する。
+// 常駐社員はクライアント接続や heartbeat を持たないため、Expire で退勤にしない。
+func (r *Registry) MarkResident(id, deviceID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.residents == nil {
+		r.residents = make(map[string]struct{})
+	}
+	r.residents[id] = struct{}{}
+
+	now := r.now()
+	if e, ok := r.employees[id]; ok {
+		e.DeviceID = deviceID
+		e.Status = StatusOnline
+		e.LastSeen = now
+		return
+	}
+	r.employees[id] = &Employee{
+		ID:       id,
+		DeviceID: deviceID,
+		Status:   StatusOnline,
+		LastSeen: now,
+	}
+}
+
+// IsResident はサーバー常駐社員かを返す。
+func (r *Registry) IsResident(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.residents[id]
+	return ok
 }
 
 // CheckIn は出勤を記録する。未登録の社員なら新規作成する。
@@ -74,6 +112,10 @@ func (r *Registry) CheckOut(id string) {
 
 	e, ok := r.employees[id]
 	if !ok {
+		return
+	}
+	// サーバー常駐社員（mgr / chat）は退勤にしない。
+	if _, resident := r.residents[id]; resident {
 		return
 	}
 	e.Status = StatusOffline
@@ -156,6 +198,10 @@ func (r *Registry) Expire(timeout time.Duration) []string {
 	var expired []string
 	for id, e := range r.employees {
 		if e.Status == StatusOffline {
+			continue
+		}
+		// サーバー常駐社員（mgr / chat）は heartbeat を送らないので対象外。
+		if _, resident := r.residents[id]; resident {
 			continue
 		}
 		if e.LastSeen.Before(cutoff) {

@@ -31,9 +31,6 @@ type ChatAgent struct {
 
 	mu    sync.RWMutex
 	state string
-
-	// models は実行時に差し替え可能なモデル名を保持する（Phase 5 の高級モデル購入）。
-	models modelState
 }
 
 // NewChatAgent は ChatAgent を生成する。Run を別 goroutine で呼ぶまで入力は処理されない。
@@ -52,19 +49,11 @@ func NewChatAgent(id string, p persona.Persona, client llm.Client, notifier Noti
 		opts:     opts,
 		inbox:    make(chan string, inboxCapacity),
 		state:    StateIdle,
-		models:   newModelState(opts.Model),
 	}
 }
 
 // ID は社員 ID を返す。
 func (c *ChatAgent) ID() string { return c.id }
-
-// SetModel は実行時に使うモデルを差し替える（Modeler、Phase 5）。
-// 空文字は設定既定（Options.Model、無ければ DefaultModel）へ戻す。
-func (c *ChatAgent) SetModel(model string) { c.models.set(model) }
-
-// Model は現在使うモデル名を返す（スレッドセーフ）。
-func (c *ChatAgent) Model() string { return c.models.get() }
 
 // State は現在の状態を返す（スレッドセーフ）。
 func (c *ChatAgent) State() string {
@@ -141,7 +130,7 @@ func (c *ChatAgent) respond(ctx context.Context, channel, prompt string) {
 		return
 	}
 
-	text, ok := converseRun(ctx, c.client, c.logger(), c.id, c.Model(), c.systemPrompt(), prompt, c.opts)
+	text, ok := converseRun(ctx, c.client, c.logger(), c.id, c.opts.Model, c.systemPrompt(), prompt, c.opts)
 	if !ok {
 		c.setState(StateIdle)
 		return

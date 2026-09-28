@@ -204,6 +204,75 @@ func TestSnapshot(t *testing.T) {
 	}
 }
 
+// TestMarkResidentStaysOnlineAndSkipsExpire は常駐社員が timeout を超えても
+// Expire で退勤にならず、online のまま留まることを確認する。
+func TestMarkResidentStaysOnlineAndSkipsExpire(t *testing.T) {
+	t0 := time.Date(2026, 9, 26, 9, 0, 0, 0, time.UTC)
+	r, c := newTestRegistry(t0)
+
+	r.MarkResident("mgr", "server")
+	if !r.IsResident("mgr") {
+		t.Fatal("MarkResident 後に IsResident(mgr) が false")
+	}
+	if e, ok := r.Get("mgr"); !ok || e.Status != StatusOnline {
+		t.Fatalf("MarkResident 直後: ok=%v status=%v, want true/online", ok, e.Status)
+	}
+
+	// timeout を大きく超えて放置しても常駐社員は Expire の対象外。
+	c.Advance(10 * time.Minute)
+	if expired := r.Expire(90 * time.Second); len(expired) != 0 {
+		t.Fatalf("Expire() = %v, want empty（常駐社員は対象外）", expired)
+	}
+
+	e, ok := r.Get("mgr")
+	if !ok {
+		t.Fatal("常駐社員のエントリが消えている")
+	}
+	if e.Status != StatusOnline {
+		t.Errorf("status = %q, want %q", e.Status, StatusOnline)
+	}
+}
+
+// TestResidentCheckOutIsIgnored は常駐社員が CheckOut されても offline にならないことを確認する。
+func TestResidentCheckOutIsIgnored(t *testing.T) {
+	r, _ := newTestRegistry(time.Date(2026, 9, 26, 9, 0, 0, 0, time.UTC))
+	r.MarkResident("chat", "server")
+
+	r.CheckOut("chat")
+
+	e, ok := r.Get("chat")
+	if !ok {
+		t.Fatal("常駐社員のエントリが消えている")
+	}
+	if e.Status != StatusOnline {
+		t.Errorf("CheckOut 後 status = %q, want %q（常駐社員は退勤しない）", e.Status, StatusOnline)
+	}
+	if got := r.Online(); !reflect.DeepEqual(got, []string{"chat"}) {
+		t.Errorf("Online() = %v, want [chat]", got)
+	}
+}
+
+// TestNonResidentStillExpires は常駐社員の除外が通常社員の Expire を壊していないことを確認する。
+func TestNonResidentStillExpires(t *testing.T) {
+	t0 := time.Date(2026, 9, 26, 9, 0, 0, 0, time.UTC)
+	r, c := newTestRegistry(t0)
+
+	r.MarkResident("mgr", "server")
+	r.CheckIn("dev_m", "zenbook")
+
+	c.Advance(2 * time.Minute)
+	expired := r.Expire(90 * time.Second)
+	if !reflect.DeepEqual(expired, []string{"dev_m"}) {
+		t.Fatalf("Expire() = %v, want [dev_m]", expired)
+	}
+	if e, _ := r.Get("dev_m"); e.Status != StatusOffline {
+		t.Errorf("dev_m status = %q, want offline", e.Status)
+	}
+	if e, _ := r.Get("mgr"); e.Status != StatusOnline {
+		t.Errorf("mgr status = %q, want online", e.Status)
+	}
+}
+
 // TestConcurrentAccess は -race 付きで並行アクセスの安全性を確認する。
 func TestConcurrentAccess(t *testing.T) {
 	r := NewRegistry()

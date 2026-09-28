@@ -53,6 +53,8 @@ pub enum ClientMsg {
         #[serde(default)]
         base_branch: String,
     },
+    /// 質問への回答（新機能）。`question_id` は [`ServerMsg::Question`] の `id`。
+    Answer { question_id: String, text: String },
 }
 
 impl ClientMsg {
@@ -107,6 +109,18 @@ pub enum ServerMsg {
         /// タスク一覧。新しい順（newest-first）で、省略・空がありうる（§13.4 追補）。
         #[serde(default)]
         tasks: Vec<TaskInfo>,
+        ts: String,
+    },
+    /// 平社員からの質問（mgr 経由、新機能）。オーナーは [`ClientMsg::Answer`] で回答する。
+    Question {
+        id: String,
+        #[serde(default)]
+        from: String,
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        task_id: String,
+        #[serde(default)]
         ts: String,
     },
     /// 未知の `type`。前方互換のためのフォールバック。
@@ -542,6 +556,58 @@ mod tests {
             r##"{"type":"say","channel":"#会議室","text":"おはよう"}"##
         );
         assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn answer_json_is_exact() {
+        let msg = ClientMsg::Answer {
+            question_id: "q-1".to_string(),
+            text: "その方針で進めてください".to_string(),
+        };
+        let json = msg.to_json();
+        assert_eq!(
+            json,
+            r#"{"type":"answer","question_id":"q-1","text":"その方針で進めてください"}"#
+        );
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn parse_question() {
+        let json = r#"{
+            "type": "question",
+            "id": "q-1",
+            "from": "dev_m",
+            "text": "確認したいこと",
+            "task_id": "t-1",
+            "ts": "2026-09-28T09:00:00Z"
+        }"#;
+        assert_eq!(
+            ServerMsg::parse(json).unwrap(),
+            ServerMsg::Question {
+                id: "q-1".to_string(),
+                from: "dev_m".to_string(),
+                text: "確認したいこと".to_string(),
+                task_id: "t-1".to_string(),
+                ts: "2026-09-28T09:00:00Z".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn question_optional_fields_default_to_empty() {
+        // 省略可能な文字列フィールドは空にフォールバックする（前方互換）。
+        let msg = ServerMsg::parse(r#"{"type":"question","id":"q-1"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ServerMsg::Question {
+                id: "q-1".to_string(),
+                from: String::new(),
+                text: String::new(),
+                task_id: String::new(),
+                ts: String::new(),
+            }
+        );
     }
 
     #[test]

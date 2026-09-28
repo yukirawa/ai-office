@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/yukirawa/ai-office/server/internal/llm"
@@ -16,16 +15,9 @@ type Converser interface {
 	Converse(ctx context.Context, channel, prompt string)
 }
 
-// Modeler は実行時にモデルを差し替えられる（Phase 5 の高級モデル購入で使う）。
-type Modeler interface {
-	SetModel(model string)
-	Model() string
-}
-
 // Agent は mgr / dev / chat の共通インターフェース。
 type Agent interface {
 	Converser
-	Modeler
 }
 
 // 3 種のエージェントが Agent を満たすことをコンパイル時に保証する。
@@ -41,40 +33,6 @@ const defaultConverseTimeout = 60 * time.Second
 
 // converseFallbackReply は応答テキストが空だったときにチャンネルへ流す文言。
 const converseFallbackReply = "(うまく言葉が出てきませんでした…)"
-
-// modelState は実行時に差し替え可能なモデル名を保持する（Phase 5 の高級モデル購入）。
-// 空の set は fallback（設定既定 = Options.Model）へ戻す。専用ミューテックスで保護する。
-type modelState struct {
-	mu       sync.RWMutex
-	model    string
-	fallback string
-}
-
-// newModelState は fallback（設定既定モデル）付きの modelState を作る。
-func newModelState(fallback string) modelState {
-	return modelState{fallback: fallback}
-}
-
-// set は現在のモデルを差し替える。空文字なら設定既定へ戻す。
-func (s *modelState) set(model string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if strings.TrimSpace(model) == "" {
-		s.model = s.fallback
-		return
-	}
-	s.model = model
-}
-
-// get は現在使うモデル名を返す。未設定なら設定既定、それも空なら空文字。
-func (s *modelState) get() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if strings.TrimSpace(s.model) == "" {
-		return s.fallback
-	}
-	return s.model
-}
 
 // converseInstruction は Converser 共通の追加システムプロンプトを組み立てる。
 func converseInstruction(name string) string {

@@ -89,3 +89,23 @@ type RemoteExecutor interface {
 type Reviewer interface {
 	Review(ctx context.Context, t Task, res Result)
 }
+
+// Question は担当者（dev など）の疑問。mgr 経由でオーナーへ上げる（§16 のエスカレーション）。
+type Question struct {
+	ID     string // 質問 ID（mgr が採番する）
+	FromID string // 質問した社員（例: dev_m）
+	TaskID string // 関連タスク（任意）
+	Text   string // 質問本文
+}
+
+// Escalator は担当者の疑問を mgr 経由でオーナーへ上げ、回答を待つ（Manager が実装）。
+// 回答が得られない（オーナー未接続・タイムアウト・ctx 終了）場合は ok=false。
+type Escalator interface {
+	Escalate(ctx context.Context, q Question) (answer string, ok bool)
+}
+
+// OwnerChannel はオーナー（TUI）へ質問を送る境界（api が実装する任意実装）。
+// Notifier とは別インターフェースにして、テスト用の Notifier 実装を壊さないようにする。
+type OwnerChannel interface {
+	AskOwner(ctx context.Context, q Question) error
+}

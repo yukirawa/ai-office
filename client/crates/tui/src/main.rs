@@ -10,6 +10,9 @@
 //! ヘッドレススモークモード:
 //! - `OFFICE_TUI_SNAPSHOT=1` または第1引数 `--snapshot` で、代替スクリーンに入らず
 //!   約2秒収集してプレーンテキストのサマリを stdout に出し、exit 0 する（入力は使わない）。
+//! - `--say <本文>`（複数回指定可、順に送信）を付けると、hello 後に #会議室 へ発言してから
+//!   同様に約2秒収集してサマリを出す。`--say` だけでもヘッドレスで起動し、`--snapshot` と併用できる。
+//!   `--say=本文` 形式にも対応する。自動テストやスクリプトから `@宛先` を 1 回叩く用途を想定。
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -17,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use futures_util::stream::SplitSink;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMsg, EmployeeInfo, RelationshipInfo, ServerMsg, TaskInfo};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -43,6 +46,8 @@ const MAX_NOTICES: usize = 500;
 const MAX_TASK_ROWS: usize = 8;
 /// スナップショットモードの収集秒数。
 const SNAPSHOT_SECS: u64 = 2;
+/// `--say` 時、最初の welcome を待つ最大時間。届かなくても発言は試みる。
+const WELCOME_TIMEOUT: Duration = Duration::from_secs(2);
 /// フレーム更新間隔（約10fps）。
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// heartbeat の送信間隔（§4.1 の推奨 30 秒）。
@@ -65,9 +70,12 @@ const HELP_LINES: &[&str] = &[
     "  /task <タイトル>  タスクを依頼",
     "  /help             このヘルプを表示",
     "  /quit, /exit      終了",
+    "  /say <本文>       質問保留中でも #会議室 へ発言",
+    "  /skip, /cancel    保留中の質問への回答をやめる",
     "  @mgr <本文>       mgr 宛てに発言 (例: @mgr 点呼)",
     "  @all <本文>       全員宛てに発言",
     "  その他の入力      #会議室 へ発言",
+    "  質問保留中        通常入力は質問への回答として送信 (回答> 表示)",
     "キー: Enter=送信 / PageUp・PageDown=スクロール / Home=最古 / End=最新",
     "      Ctrl-U=クリア / Esc・Ctrl-C=終了 (q は入力文字)",
 ];
@@ -87,6 +95,7 @@ const CHROME_ROWS: u16 = 3;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
+type WsSource = SplitStream<WsStream>;
 
 /// TUI 設定。
 #[derive(Debug, Clone)]
@@ -113,7 +122,7 @@ struct NoticeLine {
     from: String,
     text: String,
     ts: String,
-    /// TUI ローカルの表示（送信エコー / ヘルプ / システム行）。サーバー由来ではない。
+    /// TUI ローカルの表示（ヘルプ / システム行 / タスク投入の確認）。サーバー由来ではない。
     local: bool,
 }
 
@@ -163,6 +172,8 @@ struct App {
     scroll: usize,
     /// 下部の入力バッファ（カーソルは常に末尾）。
     input: String,
+    /// 未回答の質問 id。`Some` の間は通常入力を回答として送る。
+    pending_question: Option<String>,
     status: ConnectionStatus,
 }
 
@@ -177,6 +188,7 @@ impl Default for App {
             notices: Vec::new(),
             scroll: 0,
             input: String::new(),
+            pending_question: None,
             status: ConnectionStatus::Connecting,
         }
     }
@@ -188,6 +200,10 @@ impl App {
         match msg {
             ServerMsg::Welcome { office, .. } => {
                 self.online = office.online.clone();
+                // 再接続のたびにサーバーが welcome -> snapshot -> 直近ログ の順で送り直す。
+                // 直前の会話を捨ててから履歴を受け直すことで、重複表示を防ぐ。
+                self.notices.clear();
+                self.scroll = 0;
             }
             ServerMsg::Notice {
                 channel,
@@ -219,6 +235,21 @@ impl App {
                 // スナップショットは最新状態なので、追記せず置換する。
                 self.tasks = tasks.clone();
             }
+            ServerMsg::Question {
+                id, from, text, ts, ..
+            } => {
+                // 質問は #会議室 に見える行として追加する（送信者名に印を付ける）。
+                self.notices.push(NoticeLine {
+                    channel: DEFAULT_CHANNEL.to_string(),
+                    from: format!("{from}（質問）"),
+                    text: text.clone(),
+                    ts: ts.clone(),
+                    local: false,
+                });
+                self.trim_notices();
+                // 未回答の質問 id を保持する。welcome による notices クリアとは独立。
+                self.pending_question = Some(id.clone());
+            }
             ServerMsg::TaskAssign { .. }
             | ServerMsg::TaskCancel { .. }
             | ServerMsg::Error { .. }
@@ -226,7 +257,10 @@ impl App {
         }
     }
 
-    /// TUI ローカルの行（送信エコー / ヘルプ / システム行）を追加する。
+    /// TUI ローカルの行（ヘルプ / システム行 / タスク投入の確認）を追加する。
+    ///
+    /// 発言（say）のエコーには使わない。送信者自身にもサーバーから notice が届くため、
+    /// ここで足すと二重表示になり、再接続時の履歴とも順序がずれる。
     fn push_local(&mut self, text: String) {
         self.notices.push(NoticeLine {
             channel: DEFAULT_CHANNEL.to_string(),
@@ -306,26 +340,47 @@ fn main() -> Result<()> {
         .unwrap_or(false)
         || args.iter().any(|a| a == "--snapshot");
 
+    let says = parse_say_args(&args);
+
     let cfg = Config::from_env();
-    if snapshot {
-        run_snapshot(cfg)
+    // `--say` はヘッドレス専用。指定があれば snapshot と同じ経路で発言してから終了する。
+    if snapshot || !says.is_empty() {
+        run_snapshot(cfg, &says)
     } else {
         run_tui(cfg)
     }
+}
+
+/// 引数から `--say <本文>` を指定順に集める（複数回指定可）。
+///
+/// `--say=本文` 形式にも対応する。値が続かない `--say`（末尾）は無視する。
+fn parse_say_args(args: &[String]) -> Vec<String> {
+    let mut says = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(text) = arg.strip_prefix("--say=") {
+            says.push(text.to_string());
+        } else if arg == "--say" {
+            if let Some(text) = iter.next() {
+                says.push(text.clone());
+            }
+        }
+    }
+    says
 }
 
 // ---------------------------------------------------------------------------
 // ヘッドレススナップショットモード
 // ---------------------------------------------------------------------------
 
-fn run_snapshot(cfg: Config) -> Result<()> {
+fn run_snapshot(cfg: Config, says: &[String]) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     let mut app = App::default();
     rt.block_on(async {
-        let collect = connect_and_collect(&cfg, &mut app, Duration::from_secs(SNAPSHOT_SECS));
+        let collect = connect_and_collect(&cfg, &mut app, Duration::from_secs(SNAPSHOT_SECS), says);
         match timeout(Duration::from_secs(SNAPSHOT_SECS + 3), collect).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
@@ -342,8 +397,14 @@ fn run_snapshot(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// 接続して `hello` を送り、`duration` のあいだ受信して `app` を更新する。
-async fn connect_and_collect(cfg: &Config, app: &mut App, duration: Duration) -> Result<()> {
+/// 接続して `hello` を送り、`says` があれば welcome を待ってから順に発言し、
+/// `duration` のあいだ受信して `app` を更新する。
+async fn connect_and_collect(
+    cfg: &Config,
+    app: &mut App,
+    duration: Duration,
+    says: &[String],
+) -> Result<()> {
     let (ws, _resp) = tokio_tungstenite::connect_async(cfg.url.as_str()).await?;
     let (mut sink, mut stream) = ws.split();
 
@@ -354,6 +415,19 @@ async fn connect_and_collect(cfg: &Config, app: &mut App, duration: Duration) ->
     };
     sink.send(Message::text(hello.to_json())).await?;
     app.status = ConnectionStatus::Connected;
+
+    // `--say` があるときだけ welcome を待つ。`--snapshot` 単独時の挙動は変えない。
+    if !says.is_empty() {
+        wait_for_welcome(&mut stream, app).await;
+        for text in says {
+            let say = ClientMsg::Say {
+                channel: DEFAULT_CHANNEL.to_string(),
+                text: text.clone(),
+            };
+            sink.send(Message::text(say.to_json())).await?;
+            // 送信者自身にもサーバーから notice が届くため、ローカルエコーは足さない。
+        }
+    }
 
     let deadline = Instant::now() + duration;
     loop {
@@ -381,6 +455,32 @@ async fn connect_and_collect(cfg: &Config, app: &mut App, duration: Duration) ->
     let _ = sink.send(Message::text(bye.to_json())).await;
     let _ = sink.close().await;
     Ok(())
+}
+
+/// 最初の welcome を短いタイムアウト付きで待つ。届かなくても続行する（発言は試みる）。
+async fn wait_for_welcome(stream: &mut WsSource, app: &mut App) {
+    let deadline = Instant::now() + WELCOME_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Some(text) = text_of(&msg)
+                    && let Ok(parsed) = ServerMsg::parse(text)
+                {
+                    let is_welcome = matches!(parsed, ServerMsg::Welcome { .. });
+                    app.apply(&parsed);
+                    if is_welcome {
+                        break;
+                    }
+                }
+            }
+            // 切断・エラー・タイムアウトでは待たずに先へ進む。
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 /// スナップショット出力用のタスク行（新しい順、最大5件）。
@@ -538,7 +638,8 @@ fn run_ui(
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => quit = true,
                 KeyCode::Enter => {
                     let input = std::mem::take(&mut state.input);
-                    match parse_input(&input) {
+                    let action = parse_input(&input);
+                    match action {
                         InputAction::Empty => {}
                         InputAction::Quit => quit = true,
                         InputAction::Help => {
@@ -558,12 +659,21 @@ fn run_ui(
                                 base_branch: String::new(),
                             });
                         }
-                        InputAction::Say(text) => {
-                            state.push_local(format!("> {text}"));
-                            outgoing = Some(ClientMsg::Say {
-                                channel: DEFAULT_CHANNEL.to_string(),
-                                text,
-                            });
+                        // 発言・回答・スキップの振り分けは純粋関数 [`resolve_outgoing`] に集約し、
+                        // ここではその結果（送信メッセージと更新後の保留）を反映するだけにする。
+                        InputAction::Say(_)
+                        | InputAction::SayForced(_)
+                        | InputAction::SkipQuestion => {
+                            let is_skip = matches!(&action, InputAction::SkipQuestion);
+                            let had_pending = state.pending_question.is_some();
+                            let (msg, new_pending) =
+                                resolve_outgoing(&action, state.pending_question.as_deref());
+                            // `/skip` は保留があった時だけローカル通知を出す（既存挙動を維持）。
+                            if is_skip && had_pending {
+                                state.push_local("質問への回答をスキップしました".to_string());
+                            }
+                            state.pending_question = new_pending;
+                            outgoing = msg;
                         }
                     }
                 }
@@ -998,8 +1108,14 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     .split(area);
 
     // 入力行（カーソルは常に末尾なので、空でなければカーソル記号を添える）。
+    // 保留中の質問がある間は、通常入力が回答になることを分かりやすく示す。
+    let prompt = if app.pending_question.is_some() {
+        "回答> "
+    } else {
+        "> "
+    };
     let mut spans = vec![Span::styled(
-        "> ",
+        prompt,
         Style::default().add_modifier(Modifier::BOLD),
     )];
     if app.input.is_empty() {
@@ -1046,16 +1162,25 @@ enum InputAction {
     Task(String),
     /// タイトル無しの `/task`。
     TaskUsage,
-    /// #会議室 への発言。
+    /// #会議室 への発言（保留中の質問があれば回答として扱う）。
     Say(String),
+    /// `/say <本文>`。保留中の質問があっても #会議室 へ発言する（強制）。
+    SayForced(String),
+    /// `/skip`・`/cancel`。保留中の質問への回答をやめる。
+    SkipQuestion,
 }
 
 /// 入力行の文字列を解釈する（§15.2）。
 ///
 /// - `/task <タイトル>` → [`InputAction::Task`]（タイトル必須）
 /// - `/help` / `/quit` / `/exit`
+/// - `/say <本文>` → [`InputAction::SayForced`]（保留中の質問があっても発言）
+/// - `/skip` / `/cancel` → [`InputAction::SkipQuestion`]
 /// - それ以外の非空入力 → [`InputAction::Say`]
 /// - 空白のみ → [`InputAction::Empty`]
+///
+/// 保留中の質問の有無で `Say` を回答に振り分けるのは [`resolve_outgoing`] で行う。
+/// この関数は純粋にし、テストしやすさを保つ。
 fn parse_input(input: &str) -> InputAction {
     let input = input.trim();
     if input.is_empty() {
@@ -1065,7 +1190,26 @@ fn parse_input(input: &str) -> InputAction {
         "/quit" | "/exit" => return InputAction::Quit,
         "/help" => return InputAction::Help,
         "/task" => return InputAction::TaskUsage,
+        "/skip" | "/cancel" => return InputAction::SkipQuestion,
+        // `/say` 単体は本文が無いので何もしない（文字列 "/say" を発言にしない）。
+        "/say" => return InputAction::Empty,
         _ => {}
+    }
+    if let Some(rest) = input.strip_prefix("/say") {
+        let mut chars = rest.chars();
+        match chars.next() {
+            None => return InputAction::Empty,
+            // `/say <本文>`（空白区切り）だけをコマンドとして扱う。
+            Some(c) if c.is_whitespace() => {
+                let text = chars.as_str().trim();
+                if text.is_empty() {
+                    return InputAction::Empty;
+                }
+                return InputAction::SayForced(text.to_string());
+            }
+            // `/sayfoo` のような未知の語は発言として扱う。
+            Some(_) => {}
+        }
     }
     if let Some(rest) = input.strip_prefix("/task") {
         let mut chars = rest.chars();
@@ -1085,6 +1229,55 @@ fn parse_input(input: &str) -> InputAction {
         }
     }
     InputAction::Say(input.to_string())
+}
+
+/// 入力アクションと保留中の質問から、送信するメッセージと更新後の保留を決める純粋関数。
+///
+/// - 保留中でも `@宛先` や `/コマンド` で始まる [`InputAction::Say`] は通常会議室発言として
+///   送る（回答に飲み込まれると「chat しか応答しない」ように見えるため）。保留はそのまま残す。
+/// - それ以外で保留中の質問があれば [`ClientMsg::Answer`] を送り、保留をクリアする。
+/// - [`InputAction::SayForced`]（`/say`）は保留に関係なく必ず会議室発言する（保留は残す）。
+/// - [`InputAction::SkipQuestion`]（`/skip`・`/cancel`）は送信せず保留だけクリアする。
+/// - それ以外のアクション（`Empty`/`Quit`/`Help`/`Task`/`TaskUsage`）はここでは何も決めない
+///   （メッセージを送らず保留も変えない）。副作用系は呼び側（`run_ui`）に残す。
+fn resolve_outgoing(
+    action: &InputAction,
+    pending: Option<&str>,
+) -> (Option<ClientMsg>, Option<String>) {
+    match action {
+        InputAction::Say(text) => {
+            let is_mention_or_cmd = text.starts_with('@') || text.starts_with('/');
+            match pending {
+                Some(question_id) if !is_mention_or_cmd => (
+                    Some(ClientMsg::Answer {
+                        question_id: question_id.to_string(),
+                        text: text.clone(),
+                    }),
+                    None,
+                ),
+                // 通常会議室発言。送信者自身にもサーバーから notice が届くのでローカルエコーは出さない。
+                _ => (
+                    Some(ClientMsg::Say {
+                        channel: DEFAULT_CHANNEL.to_string(),
+                        text: text.clone(),
+                    }),
+                    pending.map(str::to_string),
+                ),
+            }
+        }
+        // `/say` は保留中の質問があっても #会議室 へ発言する。
+        InputAction::SayForced(text) => (
+            Some(ClientMsg::Say {
+                channel: DEFAULT_CHANNEL.to_string(),
+                text: text.clone(),
+            }),
+            pending.map(str::to_string),
+        ),
+        // `/skip`・`/cancel` は回答せずに保留をクリアする（送信しない）。通知は呼び側。
+        InputAction::SkipQuestion => (None, None),
+        // 上記以外（`Empty`/`Quit`/`Help`/`Task`/`TaskUsage`）はここでは何もしない。
+        _ => (None, pending.map(str::to_string)),
+    }
 }
 
 /// 入力バッファに 1 キー分の編集を適用する（Enter や終了系は呼び側で処理する）。
@@ -1179,11 +1372,12 @@ fn env_string(key: &str, default: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ConnectionStatus, HELP_LINES, InputAction, apply_input_key, backoff_delay,
-        parse_input, status_display, task_status_prefix, task_summary_lines, truncate_to_width,
+        App, ConnectionStatus, DEFAULT_CHANNEL, DEFAULT_TUI_ID, HELP_LINES, InputAction,
+        apply_input_key, backoff_delay, parse_input, parse_say_args, resolve_outgoing,
+        status_display, task_status_prefix, task_summary_lines, truncate_to_width,
     };
     use crossterm::event::{KeyCode, KeyModifiers};
-    use protocol::{EmployeeInfo, ServerMsg, TaskInfo};
+    use protocol::{ClientMsg, EmployeeInfo, Office, ServerMsg, TaskInfo};
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -1196,6 +1390,27 @@ mod tests {
             assignee: assignee.to_string(),
             mode: "local".to_string(),
             result: String::new(),
+        }
+    }
+
+    /// テスト用の welcome を組み立てる。
+    fn welcome(online: &[&str]) -> ServerMsg {
+        ServerMsg::Welcome {
+            session_id: "s".to_string(),
+            server_time: "t".to_string(),
+            office: Office {
+                online: online.iter().map(|s| (*s).to_string()).collect(),
+            },
+        }
+    }
+
+    /// テスト用の notice を組み立てる。
+    fn notice(from: &str, text: &str) -> ServerMsg {
+        ServerMsg::Notice {
+            channel: DEFAULT_CHANNEL.to_string(),
+            from: from.to_string(),
+            text: text.to_string(),
+            ts: "2026-09-27T14:12:01Z".to_string(),
         }
     }
 
@@ -1249,6 +1464,42 @@ mod tests {
             parse_input("/taskfoo"),
             InputAction::Say("/taskfoo".to_string())
         );
+    }
+
+    #[test]
+    fn parse_say_args_collects_repeated_flags() {
+        let args: Vec<String> = [
+            "tui",
+            "--say",
+            "@mgr 点呼",
+            "--say=おはよう",
+            "--snapshot",
+            "--say",
+            "終わり",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        // 指定順に集め、`--say=本文` 形式も受け付ける。
+        assert_eq!(
+            parse_say_args(&args),
+            vec![
+                "@mgr 点呼".to_string(),
+                "おはよう".to_string(),
+                "終わり".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_say_args_ignores_missing_value_and_absent_flag() {
+        let to_args =
+            |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| (*s).to_string()).collect() };
+        // `--say` が末尾で値が無いときは無視する。
+        assert!(parse_say_args(&to_args(&["tui", "--say"])).is_empty());
+        // `--say` 未指定なら空。
+        assert!(parse_say_args(&to_args(&["tui", "--snapshot"])).is_empty());
+        assert!(parse_say_args(&[]).is_empty());
     }
 
     #[test]
@@ -1355,6 +1606,57 @@ mod tests {
             ts: "t3".to_string(),
         });
         assert!(app.tasks.is_empty());
+    }
+
+    #[test]
+    fn welcome_clears_history_and_scroll_before_replay() {
+        let mut app = App::default();
+        for i in 0..5 {
+            app.push_local(format!("m{i}"));
+        }
+        app.scroll_up(3);
+        assert_eq!(app.notices.len(), 5);
+        assert_eq!(app.scroll, 3);
+
+        // 再接続では welcome のあとに snapshot と直近ログが続けて届く。
+        // welcome の時点で履歴とスクロールを捨てることで、同じ会話が重複しない。
+        app.apply(&welcome(&["mgr"]));
+        assert!(app.notices.is_empty());
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.online, vec!["mgr"]);
+    }
+
+    #[test]
+    fn reconnect_replaces_history_without_duplication() {
+        let mut app = App::default();
+        // 1 回目の接続: welcome のあとに履歴が 2 件届く。
+        app.apply(&welcome(&[]));
+        app.apply(&notice(DEFAULT_TUI_ID, "a"));
+        app.apply(&notice("mgr", "b"));
+        assert_eq!(app.notices.len(), 2);
+
+        // 2 回目の接続: サーバーは同じ履歴（+ 1 件）を再送する。
+        // welcome でクリアしてから受け直すので、重複せず 3 件になる。
+        app.apply(&welcome(&[]));
+        app.apply(&notice(DEFAULT_TUI_ID, "a"));
+        app.apply(&notice("mgr", "b"));
+        app.apply(&notice("mgr", "c"));
+        assert_eq!(app.notices.len(), 3);
+        assert_eq!(app.notices[0].text, "a");
+        assert_eq!(app.notices[2].text, "c");
+    }
+
+    #[test]
+    fn own_notice_is_shown_once_without_local_echo() {
+        // 送信側のローカルエコーは廃止し、送信者自身にも配られるサーバー notice を
+        // そのまま表示する。よって自分（tui_id）の notice 1 通は 1 行だけになる。
+        let mut app = App::default();
+        app.apply(&notice(DEFAULT_TUI_ID, "こんにちは"));
+        assert_eq!(app.notices.len(), 1, "自分の発言が二重にならないこと");
+        assert_eq!(app.notices[0].from, DEFAULT_TUI_ID);
+        assert_eq!(app.notices[0].text, "こんにちは");
+        // サーバー由来の行として描画する（ローカル行ではない）。
+        assert!(!app.notices[0].local);
     }
 
     #[test]
@@ -1643,5 +1945,211 @@ mod tests {
         let compact: String = scrolled.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(compact.contains("上に3件"), "{scrolled}");
         assert!(compact.contains("Endで最新"), "{scrolled}");
+    }
+
+    #[test]
+    fn parse_input_say_skip_and_cancel() {
+        // `/say <本文>` は保留中でも発言する強制 Say。前後の空白は落とす。
+        assert_eq!(
+            parse_input("/say おはよう"),
+            InputAction::SayForced("おはよう".to_string())
+        );
+        assert_eq!(
+            parse_input("  /say   補足です  "),
+            InputAction::SayForced("補足です".to_string())
+        );
+        // 本文が無い `/say` は何もしない（文字列 "/say" を発言にしない）。
+        assert_eq!(parse_input("/say"), InputAction::Empty);
+        assert_eq!(parse_input("/say   "), InputAction::Empty);
+        // `/skip`・`/cancel` は保留中の質問への回答をやめる。
+        assert_eq!(parse_input("/skip"), InputAction::SkipQuestion);
+        assert_eq!(parse_input("/cancel"), InputAction::SkipQuestion);
+        // `/sayfoo` は未知語として発言。
+        assert_eq!(
+            parse_input("/sayfoo"),
+            InputAction::Say("/sayfoo".to_string())
+        );
+        // 通常文は Say（pending の有無による分岐は呼び側の run_ui が担う）。
+        assert_eq!(
+            parse_input("おはよう"),
+            InputAction::Say("おはよう".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_question_adds_notice_and_sets_pending() {
+        let mut app = App::default();
+        app.apply(&ServerMsg::Question {
+            id: "q-1".to_string(),
+            from: "dev_m".to_string(),
+            text: "確認したいこと".to_string(),
+            task_id: "t-1".to_string(),
+            ts: "2026-09-28T09:00:00Z".to_string(),
+        });
+        assert_eq!(app.notices.len(), 1, "質問は 1 行だけ追加される");
+        assert_eq!(app.notices[0].channel, DEFAULT_CHANNEL);
+        assert_eq!(app.notices[0].from, "dev_m（質問）");
+        assert_eq!(app.notices[0].text, "確認したいこと");
+        assert!(!app.notices[0].local);
+        assert_eq!(app.pending_question.as_deref(), Some("q-1"));
+    }
+
+    #[test]
+    fn question_pending_is_independent_of_welcome_notice_clear() {
+        let mut app = App::default();
+        app.apply(&ServerMsg::Question {
+            id: "q-1".to_string(),
+            from: "dev_m".to_string(),
+            text: "確認したいこと".to_string(),
+            task_id: String::new(),
+            ts: "t".to_string(),
+        });
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.pending_question.as_deref(), Some("q-1"));
+
+        // welcome は notices をクリアするが、保留中の質問は独立して残す。
+        app.apply(&welcome(&[]));
+        assert!(app.notices.is_empty());
+        assert_eq!(app.pending_question.as_deref(), Some("q-1"));
+    }
+
+    #[test]
+    fn answer_json_and_question_parse_match_protocol() {
+        // Client -> Server の answer 表現（サーバー担当と同じ名前）。
+        let msg = ClientMsg::Answer {
+            question_id: "q-1".to_string(),
+            text: "その方針で進めてください".to_string(),
+        };
+        assert_eq!(
+            msg.to_json(),
+            r#"{"type":"answer","question_id":"q-1","text":"その方針で進めてください"}"#
+        );
+
+        // Server -> Client の question が Question にパースされる。
+        let parsed = ServerMsg::parse(
+            r#"{"type":"question","id":"q-1","from":"dev_m","text":"確認","task_id":"t-1","ts":"t"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ServerMsg::Question {
+                id: "q-1".to_string(),
+                from: "dev_m".to_string(),
+                text: "確認".to_string(),
+                task_id: "t-1".to_string(),
+                ts: "t".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn pending_mention_is_sent_as_say_and_keeps_pending() {
+        let action = InputAction::Say("@mgr こんにちは".to_string());
+        let (msg, pending) = resolve_outgoing(&action, Some("q-1"));
+        assert_eq!(
+            msg,
+            Some(ClientMsg::Say {
+                channel: DEFAULT_CHANNEL.to_string(),
+                text: "@mgr こんにちは".to_string(),
+            })
+        );
+        assert_eq!(pending.as_deref(), Some("q-1"), "保留は残る");
+    }
+
+    #[test]
+    fn pending_slash_command_is_sent_as_say_and_keeps_pending() {
+        // `parse_input` では `/task x` は Task になるが、Say として渡された場合の振る舞いを確認する。
+        let action = InputAction::Say("/task x".to_string());
+        let (msg, pending) = resolve_outgoing(&action, Some("q-1"));
+        assert_eq!(
+            msg,
+            Some(ClientMsg::Say {
+                channel: DEFAULT_CHANNEL.to_string(),
+                text: "/task x".to_string(),
+            })
+        );
+        assert_eq!(pending.as_deref(), Some("q-1"), "保留は残る");
+    }
+
+    #[test]
+    fn pending_plain_text_becomes_answer_and_clears_pending() {
+        let action = InputAction::Say("了解です".to_string());
+        let (msg, pending) = resolve_outgoing(&action, Some("q-1"));
+        assert_eq!(
+            msg,
+            Some(ClientMsg::Answer {
+                question_id: "q-1".to_string(),
+                text: "了解です".to_string(),
+            })
+        );
+        assert_eq!(pending, None, "保留はクリアされる");
+    }
+
+    #[test]
+    fn no_pending_plain_text_is_sent_as_say() {
+        let action = InputAction::Say("おはよう".to_string());
+        let (msg, pending) = resolve_outgoing(&action, None);
+        assert_eq!(
+            msg,
+            Some(ClientMsg::Say {
+                channel: DEFAULT_CHANNEL.to_string(),
+                text: "おはよう".to_string(),
+            })
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn say_forced_sends_say_even_with_pending() {
+        let action = InputAction::SayForced("強制発言".to_string());
+        let (msg, pending) = resolve_outgoing(&action, Some("q-1"));
+        assert_eq!(
+            msg,
+            Some(ClientMsg::Say {
+                channel: DEFAULT_CHANNEL.to_string(),
+                text: "強制発言".to_string(),
+            })
+        );
+        assert_eq!(pending.as_deref(), Some("q-1"), "保留は残る");
+    }
+
+    #[test]
+    fn skip_question_clears_pending_without_sending() {
+        let (msg, pending) = resolve_outgoing(&InputAction::SkipQuestion, Some("q-1"));
+        assert_eq!(msg, None, "送信しない");
+        assert_eq!(pending, None, "保留はクリアされる");
+    }
+
+    #[test]
+    fn non_say_actions_leave_pending_untouched() {
+        // 副作用系（Help/Task など）はここでは何も決めず、保留も変えない。
+        for action in [
+            InputAction::Empty,
+            InputAction::Quit,
+            InputAction::Help,
+            InputAction::TaskUsage,
+            InputAction::Task("t".to_string()),
+        ] {
+            let (msg, pending) = resolve_outgoing(&action, Some("q-1"));
+            assert_eq!(msg, None, "送信しない");
+            assert_eq!(pending.as_deref(), Some("q-1"), "保留は変えない");
+        }
+    }
+
+    #[test]
+    fn draw_input_prompt_shows_answering_when_question_pending() {
+        let app = App {
+            pending_question: Some("q-1".to_string()),
+            ..App::default()
+        };
+        let view = render_to_string(&app, 100, 30);
+        let compact: String = view.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("回答>"), "{view}");
+
+        // 保留が無ければ従来どおり `> ` プロンプト。
+        let view = render_to_string(&App::default(), 100, 30);
+        let compact: String = view.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains(">_"), "{view}");
+        assert!(!compact.contains("回答>"), "{view}");
     }
 }

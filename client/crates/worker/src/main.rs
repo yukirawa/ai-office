@@ -597,6 +597,15 @@ fn log_server_msg(msg: &ServerMsg) {
                 tasks.len()
             ));
         }
+        ServerMsg::Question {
+            id,
+            from,
+            text,
+            task_id: _,
+            ts: _,
+        } => {
+            log(format!("question: id={id} from={from} text={text}"));
+        }
         ServerMsg::Unknown => {
             log("unknown server message (ignored)");
         }

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/yukirawa/ai-office/server/internal/llm"
 	"github.com/yukirawa/ai-office/server/internal/persona"
 )
@@ -41,6 +42,8 @@ const (
 	inboxCapacity = 16
 	// repeatConclusionLimit は同一結論とみなすまでに許容する同一テキストの出現回数。
 	repeatConclusionLimit = 3
+	// defaultAnswerTimeout はオーナーへの質問の回答を待つ既定時間（§16 エスカレーション）。
+	defaultAnswerTimeout = 3 * time.Minute
 )
 
 // DefaultModel は Options.Model が未設定のときに使う既定モデル。
@@ -65,7 +68,8 @@ const (
 )
 
 // planningInstruction は mgr の計画フェーズ用の追加システムプロンプト。
-const planningInstruction = "あなたは管理職です。タスクの実行計画を短く日本語で述べてください。実行はしないこと。"
+// 担当者を明記させることで、mgr が実際に仕事を割り振る（§16）。
+const planningInstruction = "あなたは管理職です。タスクの実行計画を短く日本語で述べ、担当者を dev_m か dev_f のどちらかに決めて「担当: dev_m」のように明記してください。実行はしないこと。"
 
 // continueInstruction は応答が終端でなかった場合に次のターンへ促す汎用文言。
 // mgr / dev で共有するため、計画に依存しない言い回しにする。
@@ -95,7 +99,9 @@ type Options struct {
 	MaxTokens   int           // 1 リクエストの最大出力トークン。0 以下なら既定 1024
 	Channel     string        // 報告先チャンネル。既定 "#会議室"
 	TaskTimeout time.Duration // worker の実行結果を待つ上限。既定 5 分
-	Logger      *slog.Logger  // 既定 slog.Default()
+	// AnswerTimeout はオーナーへの質問の回答を待つ上限。既定 3 分（§16）。
+	AnswerTimeout time.Duration
+	Logger        *slog.Logger // 既定 slog.Default()
 }
 
 // Manager は 1 体の AI 社員を動かす。1 Manager = 1 goroutine を想定する。
@@ -108,17 +114,20 @@ type Manager struct {
 
 	// 割当先（dev）とタスク状態更新・関係値更新は構築後に差し替えられるため、
 	// 専用のミューテックスで保護する（§13.3 の状態遷移を mgr が駆動する）。
-	assignMu  sync.Mutex
-	assignees []*DevAgent
-	assignIdx int
-	updater   TaskUpdater
-	rel       RelationshipUpdater
+	assignMu      sync.Mutex
+	assignees     []*DevAgent
+	assignedCount map[string]int    // dev ID -> これまでの担当件数（負荷分散用）
+	online        func(string) bool // 在席判定（nil なら全員を候補にする）
+	updater       TaskUpdater
+	rel           RelationshipUpdater
 
 	mu    sync.RWMutex
 	state string
 
-	// models は実行時に差し替え可能なモデル名を保持する（Phase 5 の高級モデル購入）。
-	models modelState
+	// pending はオーナーへの質問 ID -> 回答受け渡しチャネル（§16 エスカレーション）。
+	// Escalate（dev goroutine）と Answer（api goroutine）から触るため専用ミューテックスで保護する。
+	pendingMu sync.Mutex
+	pending   map[string]chan string
 }
 
 // NewManager は Manager を生成する。Run を別 goroutine で呼ぶまでタスクは処理されない。
@@ -139,17 +148,10 @@ func NewManager(id string, p persona.Persona, client llm.Client, notifier Notifi
 			Inbox:   make(chan Task, inboxCapacity),
 			State:   StateIdle,
 		},
-		state:  StateIdle,
-		models: newModelState(opts.Model),
+		state:   StateIdle,
+		pending: make(map[string]chan string),
 	}
 }
-
-// SetModel は実行時に使うモデルを差し替える（Modeler、Phase 5）。
-// 空文字は設定既定（Options.Model、無ければ DefaultModel）へ戻す。
-func (m *Manager) SetModel(model string) { m.models.set(model) }
-
-// Model は現在使うモデル名を返す（スレッドセーフ）。
-func (m *Manager) Model() string { return m.models.get() }
 
 // normalizeOptions はゼロ値を既定値で埋める。呼び出し側の Options は変更しない。
 func normalizeOptions(opts Options) Options {
@@ -171,6 +173,9 @@ func normalizeOptions(opts Options) Options {
 	if opts.TaskTimeout <= 0 {
 		opts.TaskTimeout = defaultTaskTimeout
 	}
+	if opts.AnswerTimeout <= 0 {
+		opts.AnswerTimeout = defaultAnswerTimeout
+	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
@@ -178,12 +183,12 @@ func normalizeOptions(opts Options) Options {
 }
 
 // SetAssignees は dev エージェントの割当先を設定する。構築後でも呼べる。
-// 以降のタスクはラウンドロビンで均等に割り当てられる。
+// 以降のタスクは mgr が計画内容と負荷を見て割り当てる（§16）。
 func (m *Manager) SetAssignees(assignees ...*DevAgent) {
 	m.assignMu.Lock()
 	defer m.assignMu.Unlock()
 	m.assignees = append([]*DevAgent(nil), assignees...)
-	m.assignIdx = 0
+	m.assignedCount = make(map[string]int, len(assignees))
 }
 
 // SetTaskUpdater はタスク状態を永続化する実装（api）を設定する。構築後でも呼べる。
@@ -200,16 +205,79 @@ func (m *Manager) SetRelationships(u RelationshipUpdater) {
 	m.rel = u
 }
 
-// nextAssignee は次の割当先をラウンドロビンで返す。未設定なら nil。
-func (m *Manager) nextAssignee() *DevAgent {
+// SetOnlineFunc は在席判定関数を設定する。設定すると、割当時にオンラインの dev を優先する
+// （worker 未接続の dev に割り当てて失敗するのを減らす）。nil で全員を候補に戻す。
+func (m *Manager) SetOnlineFunc(f func(id string) bool) {
+	m.assignMu.Lock()
+	defer m.assignMu.Unlock()
+	m.online = f
+}
+
+// nextAssignee は次に割り当てる dev を「計画内容と現在の負荷」から選ぶ（§16）。
+// 計画が dev を名指ししていればそれを優先し、そうでなければ担当件数が最も少ない dev を選ぶ
+// （同数なら添字順）。割当先が未設定なら nil。
+func (m *Manager) nextAssignee(plan string) *DevAgent {
 	m.assignMu.Lock()
 	defer m.assignMu.Unlock()
 	if len(m.assignees) == 0 {
 		return nil
 	}
-	a := m.assignees[m.assignIdx%len(m.assignees)]
-	m.assignIdx++
-	return a
+	if m.assignedCount == nil {
+		m.assignedCount = make(map[string]int, len(m.assignees))
+	}
+
+	// オンラインの dev がいれば、それを候補に限定する（worker 未接続での失敗を避ける）。
+	candidates := m.assignees
+	if m.online != nil {
+		online := make([]*DevAgent, 0, len(m.assignees))
+		for _, a := range m.assignees {
+			if m.online(a.ID()) {
+				online = append(online, a)
+			}
+		}
+		if len(online) > 0 {
+			candidates = online
+		}
+	}
+
+	// 計画文で名指しされた dev（最初に現れたもの）を優先する。
+	if id := mentionedAssignee(plan, candidates); id != "" {
+		for _, a := range candidates {
+			if a.ID() == id {
+				m.assignedCount[id]++
+				return a
+			}
+		}
+	}
+
+	// 負荷（これまでの担当件数）が最も少ない dev を選ぶ。
+	best := candidates[0]
+	for _, a := range candidates[1:] {
+		if m.assignedCount[a.ID()] < m.assignedCount[best.ID()] {
+			best = a
+		}
+	}
+	m.assignedCount[best.ID()]++
+	return best
+}
+
+// mentionedAssignee は計画文中で名指しされた dev の ID を返す（無ければ ""）。
+// 複数名指しされている場合は最初に現れたものを選ぶ。
+func mentionedAssignee(plan string, assignees []*DevAgent) string {
+	lower := strings.ToLower(plan)
+	bestID := ""
+	bestPos := -1
+	for _, a := range assignees {
+		id := strings.ToLower(strings.TrimSpace(a.ID()))
+		if id == "" {
+			continue
+		}
+		if idx := strings.Index(lower, id); idx >= 0 && (bestPos < 0 || idx < bestPos) {
+			bestPos = idx
+			bestID = a.ID()
+		}
+	}
+	return bestID
 }
 
 // taskUpdater は現在の TaskUpdater を返す（未設定なら nil）。
@@ -234,6 +302,71 @@ func (m *Manager) updateTask(ctx context.Context, taskID, status, result string)
 	}
 	if err := u.UpdateTask(ctx, taskID, status, result); err != nil {
 		m.logger().Error("タスク状態の更新に失敗しました", "task_id", taskID, "status", status, "error", err)
+	}
+}
+
+// Escalate は担当者の疑問を mgr 経由でオーナーへ上げ、回答を待つ（Escalator、§16）。
+// オーナーへの経路が無い・未接続・タイムアウト・ctx 終了の場合は ok=false。
+func (m *Manager) Escalate(ctx context.Context, q Question) (string, bool) {
+	oc, ok := m.notifier.(OwnerChannel)
+	if !ok {
+		m.logger().Warn("オーナーへの質問経路が未設定です", "from", q.FromID, "task_id", q.TaskID)
+		return "", false
+	}
+	if strings.TrimSpace(q.ID) == "" {
+		q.ID = uuid.NewString()
+	}
+
+	// 回答の受け渡しチャネルを先に登録する（回答の取りこぼしを防ぐ）。
+	ch := make(chan string, 1)
+	m.pendingMu.Lock()
+	m.pending[q.ID] = ch
+	m.pendingMu.Unlock()
+	defer func() {
+		m.pendingMu.Lock()
+		delete(m.pending, q.ID)
+		m.pendingMu.Unlock()
+	}()
+
+	if err := oc.AskOwner(ctx, q); err != nil {
+		m.logger().Error("オーナーへの質問送信に失敗しました", "question_id", q.ID, "error", err)
+		return "", false
+	}
+	m.logger().Info("オーナーへ質問を上げました", "question_id", q.ID, "from", q.FromID, "task_id", q.TaskID)
+
+	timeout := m.opts.AnswerTimeout
+	if timeout <= 0 {
+		timeout = defaultAnswerTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case ans := <-ch:
+		return ans, true
+	case <-ctx.Done():
+		return "", false
+	case <-timer.C:
+		m.logger().Warn("質問への回答が時間内に得られませんでした", "question_id", q.ID)
+		return "", false
+	}
+}
+
+// Answer はオーナーの回答を、対応する Escalate の待機へ渡す（api から呼ばれる）。
+// 待機中の質問が無ければ false。
+func (m *Manager) Answer(questionID, text string) bool {
+	m.pendingMu.Lock()
+	ch := m.pending[questionID]
+	m.pendingMu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- text:
+		return true
+	default:
+		// 既に回答を渡し済み（バッファ満杯）。
+		return false
 	}
 }
 
@@ -310,7 +443,7 @@ func (m *Manager) handleTask(ctx context.Context, t Task) {
 	}
 
 	req := llm.Request{
-		Model:     m.Model(),
+		Model:     m.opts.Model,
 		System:    m.systemPrompt(),
 		Messages:  []llm.Message{{Role: "user", Content: taskPrompt(t)}},
 		MaxTokens: m.opts.MaxTokens,
@@ -408,9 +541,9 @@ type taskAssigner interface {
 	AssignTask(ctx context.Context, taskID, assignee string) error
 }
 
-// assignTask は計画済みタスクを次の dev に割り当てる。
+// assignTask は計画済みタスクを選んだ dev に割り当てる。
 func (m *Manager) assignTask(ctx context.Context, t Task, plan string) {
-	assignee := m.nextAssignee()
+	assignee := m.nextAssignee(plan)
 	if assignee == nil {
 		m.notify(ctx, fmt.Sprintf("【%s】担当者が割り当てられていません。", taskLabel(t)))
 		m.updateTask(ctx, t.ID, "failed", "no assignee")
@@ -514,7 +647,7 @@ func (m *Manager) Converse(ctx context.Context, channel, prompt string) {
 		return
 	}
 
-	text, ok := converseRun(ctx, m.client, m.logger(), m.employee.ID, m.Model(), m.converseSystemPrompt(), prompt, m.opts)
+	text, ok := converseRun(ctx, m.client, m.logger(), m.employee.ID, m.opts.Model, m.converseSystemPrompt(), prompt, m.opts)
 	if !ok {
 		m.setState(StateIdle)
 		return

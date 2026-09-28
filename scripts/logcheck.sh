@@ -19,6 +19,13 @@ fi
 
 count() { grep -ac "$1" "$SRV" 2>/dev/null || true; }
 
+# count_all はサーバーログに加え worker のログ（dev_*.log）も横断して数える。
+# 「宛先不明」など #会議室 への通知は notice として配信され、
+# サーバーログには出ないが、接続中の worker のログには残るため。
+count_all() {
+  grep -ah "$1" "$SRV" "$DIR"/dev_m.log "$DIR"/dev_f.log 2>/dev/null | wc -l | tr -d ' '
+}
+
 echo "== 解析対象: $SRV =="
 printf 'check-in              : %s\n' "$(count 'msg=check-in')"
 printf 'check-out             : %s\n' "$(count 'msg=check-out')"
@@ -27,6 +34,8 @@ printf 'task_result 受信      : %s\n' "$(count 'task_result を受信')"
 printf 'say 受信              : %s\n' "$(count 'say を受信')"
 printf '日割り給与の支給      : %s\n' "$(count '日割り給与を支給')"
 printf '雑談(chat)投稿のきっかけ: %s\n' "$(count 'chat 役へメッセージ')"
+printf '格差の観察            : %s\n' "$(count_all '格差')"
+printf '宛先不明の通知        : %s\n' "$(count_all '宛先不明')"
 
 echo
 echo "== タスクの最終状態（done / failed） =="

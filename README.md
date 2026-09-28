@@ -20,15 +20,15 @@ server/                 Go 製 officed（頭脳・記憶・調整）
     api/                HTTP / WebSocket ハンドラ + ブロードキャスト
     store/              SQLite（employees/sessions/messages/ledger/relationships/tasks）
     economy/            学の元帳
-    llm/                LLM HTTP ラッパー（Anthropic + mock）
-    agents/             AI社員 goroutine（Phase 1 は mgr の計画のみ）
+    llm/                LLM HTTP ラッパー（DeepSeek / Anthropic + mock）
+    agents/             AI社員 goroutine（mgr / dev_m / dev_f / chat）
     persona/            キャラ設定
-    gh/                 GitHub 連携（Phase 3、現在は 501 スタブ）
+    gh/                 GitHub 連携（Phase 3、App 認証 + REST / webhook）
 
 client/                 Rust workspace
   crates/protocol/      共通メッセージ型（worker と tui が共用）
   crates/worker/        常駐ワーカー（hello → heartbeat → bye）
-  crates/tui/           read-only TUI ビューア
+  crates/tui/           TUI（表示 + 入力行）
 
 scripts/                demo.sh（対話）, smoke.sh（自動E2E）
 secrets/                APIキー等（git 管理外）
@@ -93,6 +93,7 @@ TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: 
 | キー / 入力 | 動作 |
 | --- | --- |
 | `Enter` | 送信 |
+| 回答待ち（質問あり） | 入力プロンプトが `回答> ` に変わり、`Enter` で質問への回答を送信 |
 | 文字入力 | 入力行に追加（`q` も文字として入力される） |
 | `PageUp` / `PageDown` / `Home` / `End` | `#会議室` をスクロール / 先頭 / 最新へ |
 | `Backspace` / `Ctrl-U` | 1 文字削除 / 全消去 |
@@ -101,11 +102,21 @@ TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: 
 | `@mgr 〜` / `@dev_m 〜` / `@dev_f 〜` / `@chat 〜` | その社員が応答する |
 | `@all 〜` | 全員が応答する（点呼など） |
 | `/task <タイトル>` | タスクを投入（`POST /api/tasks` と同じ経路。mgr が計画→dev が実行） |
+| `/say <本文>` | 質問の回答待ちでも `#会議室` へ通常発言する |
+| `/skip` / `/cancel` | 保留中の質問への回答をやめ、待機を解除する |
 | `/help` | コマンド一覧を表示 |
 | `/quit` | 終了 |
 
 例: `おはよう` → 会議室に投稿され chat が応答。`@all 点呼です` → mgr / dev_m / dev_f / chat がそれぞれ応答。
 `/task ログイン画面を作る` → mgr が計画し dev_m / dev_f に割当て、worker が実行する。
+
+### 在席（出退勤）
+
+左の `社員` ペインに各社員の在席状態（● 在席 / ○ 退勤 など）が表示される。
+
+- `mgr` と `chat` は**サーバー常駐**でクライアント接続を持たない。起動直後から**常時在席**として
+  扱い、heartbeat が無くても退勤にしない（`presence.Registry.MarkResident`。タイムアウトの Expire 対象外）。
+- `dev_m` / `dev_f` は**worker 接続**で出勤し、切断（または `OFFICE_HEARTBEAT_TIMEOUT` 超過）で退勤する。
 
 ## 手動で起動する
 
@@ -143,7 +154,7 @@ curl http://127.0.0.1:8787/api/tasks?limit=5
 ```
 POST /api/tasks
   -> mgr: LLM で計画を立て #会議室 に投稿
-  -> mgr: dev_m / dev_f にラウンドロビンで割当（tasks.status=assigned）
+  -> mgr: オンライン優先で、計画が名指しした担当（無ければ負荷の少ない dev）に割当（tasks.status=assigned）
   -> dev: 計画を JSON アクションに変換して task_assign を送信（status=working）
   -> worker: OFFICE_WORKSPACE 内で実行（bubblewrap サンドボックス）
   -> worker: task_result を返す（status=review）
@@ -159,6 +170,24 @@ worker の実行モード:
   短命の installation token を `task_assign` の payload で受け取る。worker がオフラインの
   ときはサーバー側（`gh`）が PR を作る。
 
+## 質問と回答（エスカレーション）
+
+平社員（dev）が作業中に情報が足りず判断できないときは、mgr 経由でオーナーに質問が上がる。
+
+```
+POST /api/tasks
+  -> dev: 計画中に疑問を検出（LLM が {"question":"..."} を返す）
+  -> mgr: 質問をオーナー（TUI）へ上げ、回答を待つ（上限 OFFICE_ANSWER_TIMEOUT、既定 3m）
+  -> オーナー: TUI の #会議室 に `dev_m（質問）: ...` と表示され、`回答> ` に回答を入力
+  -> mgr -> dev: 回答を受け取り、それを踏まえて計画をやり直す
+```
+
+- 質問が未回答の間、TUI の入力プロンプトは `回答> ` になり、`Enter` で回答を送る。
+  `#会議室` へ通常発言したいときは `/say <本文>`、回答せず保留を解除するときは `/skip`（`/cancel`）。
+- オーナー（TUI）が接続していないときは質問せず即フォールバックし、そのまま作業を続ける
+  （長時間ブロックしてタスクが滞留するのを避ける）。
+- 回答待ちの上限は `OFFICE_ANSWER_TIMEOUT`（既定 `3m`）。超過すると回答なしとして続行する。
+
 ## 関係値と雑談（Phase 4）
 
 - **関係値（4.2）**: タスクの成功／失敗で mgr と担当者の `affinity`（-100〜+100）と `trust`（0〜100）が
@@ -171,6 +200,33 @@ worker の実行モード:
   ```
 - **雑談 cron（4.4）**: `OFFICE_CHAT_CRON` の間隔で chat 役が `#会議室` に一言投稿する
   （`off` で無効）。
+
+## 学と経済（Phase 5）
+
+### 会議室の宛先（@宛先）
+
+`#会議室` の本文先頭に宛先を書くと、その社員が応答する（「TUI の操作」表と同じ）。
+
+- `@mgr 〜` / `@dev_m 〜` / `@dev_f 〜` / `@chat 〜` … その社員が 1 往復で応答する。
+- `@all 〜` … 全員が応答する（点呼など）。
+- 全角の「＠」・全角スペースや `、`・`:` 区切りでも機能する（日本語 IME 対策。`＠mgr　点呼` / `@mgr、点呼` / `@mgr: 点呼` はいずれも mgr 宛て）。
+- 宛先なし … 従来どおり chat 役が応答する。
+
+### 経済 API
+
+| メソッド | パス | 説明 |
+| --- | --- | --- |
+| GET | `/api/ledger` | 全社員の残高 |
+| GET | `/api/ledger/:id/entries?limit=` | その社員の元帳履歴（既定 `limit=50`） |
+| GET | `/api/economy/status` | 残高分布（min/max/spread）と格差 alert |
+
+### 環境変数（Phase 5）
+
+- `OFFICE_INEQUALITY_CRON`: 格差観察 cron（`off` で無効）。
+- `OFFICE_INEQUALITY_THRESHOLD`: 既定 500。spread がこれ以上だと通知する。
+
+**学の格差観察は観察のみ**で、閾値を超えても通知するだけで、労働運動などの行動はまだ実装していない
+（Phase 6 以降）。
 
 ## 実APIキーで動かす（DeepSeek / Anthropic）
 
@@ -339,10 +395,13 @@ check-in/out、タスク遷移、say、cron、ERROR/WARN、panic を集計し PA
 | `OFFICE_PAYROLL_CRON` | `0 9 * * *` | 日割り給与の cron（`@every 5s` も可） |
 | `OFFICE_PAYROLL_TZ` | `Asia/Tokyo` | cron のタイムゾーン |
 | `OFFICE_CHAT_CRON` | `0 * * * *` | 雑談 cron（`off` で無効） |
+| `OFFICE_ANSWER_TIMEOUT` | `3m` | オーナーへの質問の回答を待つ上限（§16 エスカレーション） |
 | `OFFICE_LLM_PROVIDER` | `mock` | `mock` / `deepseek` / `anthropic` |
 | `OFFICE_LLM_MODEL` | プロバイダ既定 | モデル名（deepseek-chat / claude-3-5-haiku-latest） |
 | `OFFICE_LLM_TIMEOUT` | `120s` | 1 リクエストのタイムアウト |
 | `OFFICE_LLM_MAX_TOKENS` | `1024` | 1 リクエストの最大出力トークン |
+| `OFFICE_INEQUALITY_CRON` | `0 * * * *` | 格差観察 cron（`off` で無効） |
+| `OFFICE_INEQUALITY_THRESHOLD` | `500` | 残高の差（spread）がこれ以上で通知（観察のみ） |
 | `DEEPSEEK_API_KEY` | （空） | 未設定なら `secrets/deepseek.key` を読む |
 | `OFFICE_DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API のベース URL |
 | `ANTHROPIC_API_KEY` | （空） | 未設定なら `secrets/anthropic.key` を読む |
@@ -373,8 +432,7 @@ worker の追加設定:
 | GET | `/api/tasks` | タスク一覧（`?status=&limit=`） |
 | POST | `/api/chat` | オーナーの発言に chat 役が応答 |
 | GET | `/api/ledger` | 全社員の残高（Phase 5） |
-| GET | `/api/ledger/:id/entries` | 元帳履歴（Phase 5） |
-| POST | `/api/economy/purchase` | 高級モデル購入（Phase 5） |
+| GET | `/api/ledger/:id/entries` | 元帳履歴（`?limit=`、Phase 5） |
 | GET | `/api/economy/status` | 残高分布・格差（Phase 5） |
 | GET | `/api/llm` | LLM プロバイダ/モデル/設定の表示 |
 | POST | `/api/llm/ping` | LLM へ 1 回だけ問い合わせて疎通確認 |
@@ -384,8 +442,8 @@ worker の追加設定:
 
 - **Phase 0（完了）**: protocol crate / presence + WS / worker 接続ループ / TUI read-only
 - **Phase 1（完了）**: SQLite store / LLM HTTP ラッパー（Anthropic + mock）/ mgr エージェント（計画）/ 日割り給与 cron
-- **Phase 2（完了）**: `task_assign`/`task_result` / worker Local モード（ファイル操作）/ bubblewrap サンドボックス / dev_m・dev_f エージェント（mgr がラウンドロビン割当 → レビュー）
+- **Phase 2（完了）**: `task_assign`/`task_result` / worker Local モード（ファイル操作）/ bubblewrap サンドボックス / dev_m・dev_f エージェント（mgr が計画で担当を指名、無ければ負荷分散で割当 → レビュー）
 - **Phase 3（実装済み・要資格情報）**: GitHub App 認証（JWT → installation token）/ worker Remote モード（ブランチ → コミット → PR）/ webhook 署名検証 → タスク化 / worker 不在時のサーバー側 PR 作成
 - **Phase 4（完了）**: ペルソナ（既存 + chat 役）/ 関係値システム（タスク結果で変動）/ chat 役（Ollama なし）/ 雑談 cron / TUI のタスクペイン・入力行・スクロール・@宛先
-- **Phase 5（実装済み）**: 学の元帳/残高 API・高級モデル購入（実行時モデル差し替え）・格差の観察（観察のみ）。次は労働運動トリガーの具体化・高級モデル価格の調整・Web UI（Phase 6）
-- 次は Phase 5（学の元帳・残高API、高級モデル購入、労働運動トリガーの観察）
+- **Phase 5（実装済み）**: 学の元帳/残高 API・格差の観察（観察のみ）・質問と回答のエスカレーション（dev → mgr → オーナー。TUI の `回答> ` で応答）
+- **次は Phase 6**: 労働運動トリガーの具体化・Web UI

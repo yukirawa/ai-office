@@ -176,6 +176,10 @@ func run() error {
 
 	// ---- 在席 ----
 	reg := presence.NewRegistry()
+	// mgr / chat はサーバー常駐（クライアント接続を持たない）。在席として登録し、
+	// heartbeat が無くても退勤扱いにしない（§3「鰯常駐」）。
+	reg.MarkResident(config.EmployeeManagerID, "server")
+	reg.MarkResident(config.EmployeeChatID, "server")
 
 	// ---- 経済 ----
 	econ := economy.New(st)
@@ -212,7 +216,12 @@ func run() error {
 		client, srv, srv, srv, srv, mgr, agentOptions(cfg, logger),
 	)
 	mgr.SetAssignees(devM, devF)
+	// Phase 5: 担当者の疑問を mgr 経由でオーナーへ上げられるようにする（§16）。
+	devM.SetEscalator(mgr)
+	devF.SetEscalator(mgr)
 	mgr.SetTaskUpdater(srv)
+	// オンラインの dev を優先して割り当てる（worker 未接続での失敗を減らす）。
+	mgr.SetOnlineFunc(srv.IsEmployeeOnline)
 	// Phase 4.2: 関係値（persona.Service は agents.RelationshipUpdater を満たす）。
 	mgr.SetRelationships(persona.NewService(st))
 	srv.SetManager(mgr)
@@ -360,12 +369,13 @@ func buildLLM(cfg *config.Config, logger *slog.Logger) llm.Client {
 // agentOptions は mgr / dev / chat 共通の Options を設定から組み立てる。
 func agentOptions(cfg *config.Config, logger *slog.Logger) agents.Options {
 	return agents.Options{
-		MaxTurns:    cfg.MaxAgentTurns,
-		TokenBudget: cfg.TokenBudget,
-		Model:       cfg.LLMModel,
-		MaxTokens:   cfg.LLMMaxTokens,
-		Channel:     "#会議室",
-		Logger:      logger,
+		MaxTurns:      cfg.MaxAgentTurns,
+		TokenBudget:   cfg.TokenBudget,
+		Model:         cfg.LLMModel,
+		MaxTokens:     cfg.LLMMaxTokens,
+		Channel:       "#会議室",
+		AnswerTimeout: cfg.AnswerTimeout,
+		Logger:        logger,
 	}
 }
 
