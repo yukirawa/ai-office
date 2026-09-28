@@ -37,6 +37,7 @@ OFFICE_ADDR="127.0.0.1:${PORT}" \
 OFFICE_LLM_PROVIDER="mock" \
 OFFICE_PAYROLL_CRON="@every 5s" \
 OFFICE_CHAT_CRON="@every 5s" \
+OFFICE_INITIATIVE_CRON="off" \
 OFFICE_INEQUALITY_THRESHOLD=1 \
 "${OUT}/officed" > "${OUT}/server.log" 2>&1 &
 SRV_PID=$!

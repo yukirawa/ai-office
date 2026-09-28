@@ -25,7 +25,8 @@ const MAX_DETAIL_LEN: usize = 16 * 1024;
 /// local モードの実行環境。
 #[derive(Debug, Clone)]
 pub struct LocalEnv {
-    /// 作業ディレクトリ（`OFFICE_WORKSPACE`）。local モードでは必須。
+    /// 作業ディレクトリ。タスクの `workspace` 指定があればそのルート、
+    /// なければ `OFFICE_WORKSPACE`。local モードでは必須。
     pub root: Option<PathBuf>,
     /// `OFFICE_ALLOW_EXEC=1` のときのみ `exec` を許可する。
     pub allow_exec: bool,
@@ -44,8 +45,10 @@ pub struct LocalResult {
 
 /// `actions[]` を順番に実行する。
 ///
-/// 途中で 1 つでも拒否・失敗したら `failed` を返す。`on_progress` は各アクションの
-/// 開始前に `(percent, message)` で呼ばれる（進捗通知は任意なので best-effort）。
+/// 個々のアクションの失敗では中断せず、最後まで実行して結果を集約する。
+/// これは自律的な探索（存在しないファイルの read など）を許容するため。
+/// ひとつも成功せず全滅した場合のみ `failed` を返す。
+/// `on_progress` は各アクションの開始前に `(percent, message)` で呼ばれる。
 pub fn execute_local(
     payload: &TaskAssignPayload,
     env: &LocalEnv,
@@ -77,6 +80,8 @@ pub fn execute_local(
 
     let mut log_lines: Vec<String> = Vec::new();
     let mut artifacts: Vec<Artifact> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut ok_count = 0usize;
 
     for (i, action) in payload.actions.iter().enumerate() {
         if cancelled.load(Ordering::Relaxed) {
@@ -105,15 +110,30 @@ pub fn execute_local(
         };
 
         if let Err(reason) = outcome {
-            log_lines.push(format!("ERROR: {reason}"));
-            return failed_with(reason, log_lines, artifacts);
+            // 1 つの失敗では全体を止めない（探索での「無いファイルの read」などを許容）。
+            log_lines.push(format!("WARN: {reason}"));
+            errors.push(reason);
+        } else {
+            ok_count += 1;
         }
     }
 
-    let summary = if let Some(first) = artifacts.first() {
-        format!("{total} アクションを実行しました（write {}）", first.path)
+    // ひとつも成功しなかった場合は失敗とする（例: 唯一の write が失敗）。
+    if ok_count == 0 && !errors.is_empty() {
+        return failed_with(errors.join("; "), log_lines, artifacts);
+    }
+
+    let summary = if errors.is_empty() {
+        if let Some(first) = artifacts.first() {
+            format!("{total} アクションを実行しました（write {}）", first.path)
+        } else {
+            format!("{total} アクションを実行しました")
+        }
     } else {
-        format!("{total} アクションを実行しました")
+        format!(
+            "{total} アクション中 {ok_count} 件成功、{} 件失敗",
+            errors.len()
+        )
     };
     LocalResult {
         status: "done",
@@ -161,6 +181,125 @@ pub fn resolve_within(root: &Path, requested: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(normalized)
+}
+
+/// タスクごとの作業先を、許可ルートに照らして決定する。
+///
+/// - `requested` が空なら `base`（`OFFICE_WORKSPACE`）を従来どおり使う。
+/// - 非空なら canonicalize（未作成なら実在する最も近い祖先を canonicalize）した上で、
+///   `allowed` + `base` のいずれかの配下にあることを確認する。
+///   許可ルートが空のときは `base` のみ許可する。
+/// - 許可外なら `Err`。決定したルートが無ければ `create_dir_all` する。
+///
+/// 許可判定は canonicalize 済みで行うため、シンボリックリンクでの脱出も防げる。
+pub fn resolve_task_root(
+    requested: &str,
+    base: Option<&PathBuf>,
+    allowed: &[PathBuf],
+) -> Result<PathBuf, String> {
+    // 許可ルートを canonicalize した集合を作る。base（workspace）も常に含める。
+    let mut allowed_canon: Vec<PathBuf> = Vec::new();
+    let mut push_allowed = |candidate: &Path| {
+        if candidate.as_os_str().is_empty() {
+            return;
+        }
+        if let Ok(c) = canonicalize_lenient(candidate)
+            && !allowed_canon.contains(&c)
+        {
+            allowed_canon.push(c);
+        }
+    };
+    if let Some(base) = base {
+        push_allowed(base);
+    }
+    for root in allowed {
+        push_allowed(root);
+    }
+
+    let requested = requested.trim();
+    if requested.is_empty() {
+        let Some(base) = base.filter(|p| !p.as_os_str().is_empty()) else {
+            return Err("OFFICE_WORKSPACE が未設定です（local モードには必須）".to_string());
+        };
+        let root = canonicalize_lenient(base)?;
+        ensure_dir(&root)?;
+        return Ok(root);
+    }
+
+    let root = canonicalize_lenient(Path::new(requested))?;
+    if !allowed_canon.iter().any(|a| root.starts_with(a)) {
+        return Err(format!(
+            "作業先が許可されていません: {requested}（OFFICE_ALLOWED_ROOTS に追加してください）"
+        ));
+    }
+    ensure_dir(&root)?;
+    Ok(root)
+}
+
+/// 作業ディレクトリを必要なら作成する。
+fn ensure_dir(root: &Path) -> Result<(), String> {
+    if root.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(root)
+        .map_err(|err| format!("作業先を作成できません {}: {err}", root.display()))
+}
+
+/// `path` を可能な範囲で canonicalize する。
+///
+/// 実在すればそのまま canonicalize し、未作成なら実在する最も近い祖先を
+/// canonicalize してから残りの要素を字句的に連結する。これにより、まだ無い
+/// 作業先でもシンボリックリンク脱出を判定できる。
+pub fn canonicalize_lenient(path: &Path) -> Result<PathBuf, String> {
+    let normalized = normalize_lexical(path);
+    if let Ok(canon) = normalized.canonicalize() {
+        return Ok(canon);
+    }
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = normalized;
+    loop {
+        let Some(parent) = probe.parent().map(Path::to_path_buf) else {
+            return Err(format!("パスを解決できません: {}", path.display()));
+        };
+        if let Some(name) = probe.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        match parent.canonicalize() {
+            Ok(canon) => {
+                let mut result = canon;
+                for part in suffix.iter().rev() {
+                    result.push(part);
+                }
+                return Ok(result);
+            }
+            Err(_) if !parent.as_os_str().is_empty() => probe = parent,
+            Err(err) => return Err(format!("パスを解決できません {}: {err}", path.display())),
+        }
+    }
+}
+
+/// `exec` の実コマンド（実行ファイルと引数）を決める。
+///
+/// LLM は `mkdir -p a && echo hi > a/f` のようなシェル風の 1 行コマンドを
+/// `cmd` にそのまま入れ、`args` を空にしてくることが多い。そのままだと実行
+/// ファイル名として扱われて失敗するため、`args` が空で `cmd` に空白かシェル
+/// メタ文字を含むときだけ `sh -c <cmd>` に正規化する。`args` があるときは
+/// 従来どおりそのまま使う。
+fn normalize_exec(cmd: &str, args: &[String]) -> (String, Vec<String>) {
+    if args.is_empty() && cmd.chars().any(is_shell_meta) {
+        ("sh".to_string(), vec!["-c".to_string(), cmd.to_string()])
+    } else {
+        (cmd.to_string(), args.to_vec())
+    }
+}
+
+/// シェル経由を要する文字（空白・引用符・制御文字・展開）かどうか。
+fn is_shell_meta(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '\'' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$'
+        )
 }
 
 /// `.` / `..` をファイルシステムに触れず字句的に解決する。
@@ -280,22 +419,24 @@ fn do_exec(
         return Err(format!("cwd がディレクトリではありません: {}", action.cwd));
     }
 
+    // シェル風の 1 行コマンドを `sh -c` に正規化してから bwrap / none 双方で使う。
+    let (prog, args) = normalize_exec(cmd, &action.args);
     let mut command = match env.sandbox {
         SandboxMode::Bwrap => {
             let ro = sandbox::default_ro_binds();
             let mut c = std::process::Command::new("bwrap");
-            c.args(sandbox::bwrap_args(root, &ro, &cwd, cmd, &action.args));
+            c.args(sandbox::bwrap_args(root, &ro, &cwd, &prog, &args));
             c
         }
         SandboxMode::None => {
-            let mut c = std::process::Command::new(cmd);
-            c.args(&action.args);
+            let mut c = std::process::Command::new(&prog);
+            c.args(&args);
             c.current_dir(&cwd);
             c
         }
     };
 
-    log_lines.push(format!("{step} {cmd} {}", action.args.join(" ")));
+    log_lines.push(format!("{step} {prog} {}", args.join(" ")));
     let output = command
         .output()
         .map_err(|err| format!("exec 起動失敗 {cmd}: {err}"))?;
@@ -599,5 +740,94 @@ mod tests {
         );
         assert_eq!(res.status, "failed");
         assert!(res.summary.contains("未知の op"));
+    }
+
+    #[test]
+    fn resolve_task_root_allows_within_allowed_roots() {
+        // 許可ルート内の（未作成の）サブディレクトリは採用され、作成される。
+        let base = temp_dir("root-base-in");
+        let allowed_root = temp_dir("root-allowed-in");
+        let target = allowed_root.join("some-site");
+        let got = resolve_task_root(
+            target.to_str().unwrap(),
+            Some(&base),
+            &[allowed_root.clone()],
+        )
+        .expect("allowed root should be accepted");
+        assert_eq!(got, target.canonicalize().unwrap());
+        assert!(target.is_dir(), "missing root must be created");
+    }
+
+    #[test]
+    fn resolve_task_root_rejects_outside_allowed_roots() {
+        // 許可ルート外はエラー。
+        let base = temp_dir("root-base-out");
+        let allowed_root = temp_dir("root-allowed-out");
+        let outside = temp_dir("root-outside");
+        let target = outside.join("site");
+        let err = resolve_task_root(target.to_str().unwrap(), Some(&base), &[allowed_root])
+            .expect_err("outside root must be rejected");
+        assert!(err.contains("許可されていません"), "{err}");
+        assert!(err.contains("OFFICE_ALLOWED_ROOTS"), "{err}");
+        assert!(!target.exists(), "rejected root must not be created");
+    }
+
+    #[test]
+    fn resolve_task_root_base_workspace_is_always_allowed() {
+        // allowed が空でも base は常に許可される。
+        let base = temp_dir("root-base-always");
+        let target = base.join("proj");
+        let got = resolve_task_root(target.to_str().unwrap(), Some(&base), &[])
+            .expect("base workspace must always be allowed");
+        assert_eq!(got, target.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_task_root_empty_request_uses_base() {
+        let base = temp_dir("root-empty");
+        let got = resolve_task_root("", Some(&base), &[]).unwrap();
+        assert_eq!(got, base.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_task_root_rejects_symlink_escape() {
+        // 許可ルート内のシンボリックリンクが外を指す場合は拒否する。
+        let base = temp_dir("root-base-sym");
+        let allowed_root = temp_dir("root-sym-allowed");
+        let outside = temp_dir("root-sym-outside");
+        std::os::unix::fs::symlink(&outside, allowed_root.join("link")).unwrap();
+        let target = allowed_root.join("link/secret");
+        let err = resolve_task_root(target.to_str().unwrap(), Some(&base), &[allowed_root])
+            .expect_err("symlink escape must be rejected");
+        assert!(err.contains("許可されていません"), "{err}");
+    }
+
+    #[test]
+    fn normalize_exec_rewrites_shell_style_cmd() {
+        // args 空＋シェル風の 1 行コマンドは `sh -c` に正規化される。
+        let (prog, args) = normalize_exec("mkdir -p a && echo hi > a/f", &[]);
+        assert_eq!(prog, "sh");
+        assert_eq!(
+            args,
+            vec!["-c".to_string(), "mkdir -p a && echo hi > a/f".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_exec_keeps_explicit_args() {
+        // args があるときは従来どおりそのまま使う。
+        let args_in = vec!["-c".to_string(), "echo hi".to_string()];
+        let (prog, args) = normalize_exec("/bin/sh", &args_in);
+        assert_eq!(prog, "/bin/sh");
+        assert_eq!(args, args_in);
+    }
+
+    #[test]
+    fn normalize_exec_keeps_plain_command() {
+        // シェルメタ文字を含まない単純なコマンドはそのまま。
+        let (prog, args) = normalize_exec("ls", &[]);
+        assert_eq!(prog, "ls");
+        assert!(args.is_empty());
     }
 }

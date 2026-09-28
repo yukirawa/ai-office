@@ -415,6 +415,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		Mode        string `json:"mode"`
 		Repo        string `json:"repo"`
 		BaseBranch  string `json:"base_branch"`
+		Workspace   string `json:"workspace"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "JSON の解釈に失敗しました")
@@ -428,13 +429,16 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		Mode:        body.Mode,
 		Repo:        body.Repo,
 		BaseBranch:  body.BaseBranch,
+		Workspace:   body.Workspace,
 	})
 	if err != nil {
 		status := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "必須") {
+		switch {
+		case strings.Contains(err.Error(), "必須"):
 			status = http.StatusBadRequest
-		}
-		if strings.Contains(err.Error(), "満杯") {
+		case strings.Contains(err.Error(), "許可されていません"):
+			status = http.StatusBadRequest
+		case strings.Contains(err.Error(), "満杯"):
 			status = http.StatusServiceUnavailable
 		}
 		writeJSONError(w, status, err.Error())

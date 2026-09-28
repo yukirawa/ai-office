@@ -12,6 +12,8 @@
 //! - `OFFICE_MAX_RETRIES`   既定 0（0 は無限リトライ）
 //! - `OFFICE_VERSION`       既定 `0.1.0`
 //! - `OFFICE_WORKSPACE`     local モードの作業ディレクトリ（local では必須）
+//! - `OFFICE_ALLOWED_ROOTS` タスクで作業先に指定できる許可ルート（`:` 区切り）。
+//!                          `OFFICE_WORKSPACE` 自体も常に含まれる
 //! - `OFFICE_SANDBOX`       `bwrap`（既定） | `none`
 //! - `OFFICE_ALLOW_EXEC`    `1` のときだけ `exec` を許可
 //! - `OFFICE_GITHUB_API_URL` 既定 `https://api.github.com`
@@ -68,6 +70,8 @@ struct Config {
     version: String,
     /// local モードの作業ディレクトリ。
     workspace: Option<PathBuf>,
+    /// タスクで作業先に指定できる許可ルート（`OFFICE_ALLOWED_ROOTS` + workspace）。
+    allowed_roots: Vec<PathBuf>,
     /// `OFFICE_ALLOW_EXEC=1` のときだけ true。
     allow_exec: bool,
     /// `OFFICE_SANDBOX` の生値（解釈は local 実行時）。
@@ -90,6 +94,11 @@ impl Config {
             );
         }
 
+        let workspace = env_opt_path("OFFICE_WORKSPACE");
+        // `OFFICE_ALLOWED_ROOTS` を読み、`OFFICE_WORKSPACE` 自体も常に許可する。
+        let allowed_roots =
+            merge_allowed_roots(workspace.as_ref(), env_path_list("OFFICE_ALLOWED_ROOTS"));
+
         Ok(Self {
             url: env_string("OFFICE_SERVER_URL", DEFAULT_URL),
             employee_id,
@@ -97,7 +106,8 @@ impl Config {
             heartbeat_secs: env_u64("OFFICE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS).max(1),
             max_retries: env_u64("OFFICE_MAX_RETRIES", 0),
             version: env_string("OFFICE_VERSION", DEFAULT_VERSION),
-            workspace: env_opt_path("OFFICE_WORKSPACE"),
+            workspace,
+            allowed_roots,
             allow_exec: env_flag("OFFICE_ALLOW_EXEC"),
             sandbox_raw: std::env::var("OFFICE_SANDBOX").unwrap_or_default(),
             github_api_url: env_string("OFFICE_GITHUB_API_URL", remote::DEFAULT_API_BASE),
@@ -140,6 +150,18 @@ async fn main() -> Result<()> {
             cfg.sandbox_raw.trim()
         },
         cfg.github_api_url,
+    ));
+    log(format!(
+        "task allowed_roots: {}",
+        if cfg.allowed_roots.is_empty() {
+            "(none)".to_string()
+        } else {
+            cfg.allowed_roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":")
+        }
     ));
 
     // SIGINT / SIGTERM を watch チャネルに流す。
@@ -461,7 +483,17 @@ async fn execute_task(
 
     match mode {
         "local" => {
-            let env = build_local_env(cfg);
+            // タスクごとの作業先を決める（未指定なら `OFFICE_WORKSPACE`）。
+            let root = match local::resolve_task_root(
+                &payload.workspace,
+                cfg.workspace.as_ref(),
+                &cfg.allowed_roots,
+            ) {
+                Ok(root) => root,
+                Err(reason) => return fail(reason),
+            };
+            log(format!("task {task_id}: workspace={}", root.display()));
+            let env = build_local_env(cfg, Some(root));
             let progress_task_id = task_id.to_string();
             let progress_out = out.clone();
             let cancelled = cancelled.clone();
@@ -525,7 +557,9 @@ async fn execute_task(
 }
 
 /// `Config` から local 実行環境を組み立てる（bwrap 不在なら `none` に落とす）。
-fn build_local_env(cfg: &Config) -> local::LocalEnv {
+///
+/// `root` はタスクごとに決めた作業ディレクトリ（未指定なら `OFFICE_WORKSPACE`）。
+fn build_local_env(cfg: &Config, root: Option<PathBuf>) -> local::LocalEnv {
     let (mut mode, warning) = sandbox::SandboxMode::from_env_value(&cfg.sandbox_raw);
     if let Some(warning) = warning {
         log(warning);
@@ -538,10 +572,23 @@ fn build_local_env(cfg: &Config) -> local::LocalEnv {
         mode = sandbox::SandboxMode::None;
     }
     local::LocalEnv {
-        root: cfg.workspace.clone(),
+        root,
         allow_exec: cfg.allow_exec,
         sandbox: mode,
     }
+}
+
+/// `OFFICE_ALLOWED_ROOTS` と `OFFICE_WORKSPACE` を統合する。
+///
+/// `OFFICE_WORKSPACE` 自体は常に許可ルートに含める（従来の挙動を保つため）。
+fn merge_allowed_roots(workspace: Option<&PathBuf>, mut allowed: Vec<PathBuf>) -> Vec<PathBuf> {
+    if let Some(ws) = workspace
+        && !ws.as_os_str().is_empty()
+        && !allowed.contains(ws)
+    {
+        allowed.push(ws.clone());
+    }
+    allowed
 }
 
 /// `bye` を送る（welcome 待ちの間のみ使用）。
@@ -701,6 +748,23 @@ fn env_opt_path(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// `:` 区切りのディレクトリ一覧を `PathBuf` の列として読む（空要素は無視）。
+///
+/// 未設定・空文字なら空ベクトル。
+fn env_path_list(key: &str) -> Vec<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(':')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `1` / `true` / `yes`（大文字小文字を問わない）を真として読む。
 fn env_flag(key: &str) -> bool {
     match std::env::var(key) {
@@ -730,7 +794,8 @@ fn env_u64(key: &str, default: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_delay, env_flag};
+    use super::{backoff_delay, env_flag, merge_allowed_roots};
+    use std::path::PathBuf;
     use std::time::Duration;
 
     #[test]
@@ -756,6 +821,23 @@ mod tests {
         unsafe { std::env::set_var("OFFICE_TEST_FLAG", "0") };
         assert!(!env_flag("OFFICE_TEST_FLAG"));
         unsafe { std::env::remove_var("OFFICE_TEST_FLAG") };
+    }
+
+    #[test]
+    fn allowed_roots_always_include_workspace() {
+        // OFFICE_WORKSPACE 自体は常に許可ルートに含められる。
+        let ws = PathBuf::from("/home/user/Dev/office-ws");
+        let roots = merge_allowed_roots(Some(&ws), vec![PathBuf::from("/home/user/Dev/site-a")]);
+        assert!(roots.contains(&ws));
+        assert!(roots.contains(&PathBuf::from("/home/user/Dev/site-a")));
+
+        // 既に含まれていれば重複しない。
+        let roots = merge_allowed_roots(Some(&ws), vec![ws.clone()]);
+        assert_eq!(roots.len(), 1);
+
+        // workspace 未設定ならそのまま。
+        let roots = merge_allowed_roots(None, vec![PathBuf::from("/x")]);
+        assert_eq!(roots, vec![PathBuf::from("/x")]);
     }
 
     #[test]

@@ -101,7 +101,7 @@ TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: 
 | 通常のテキスト | `#会議室` へ発言（`say`）。chat 役が返信する |
 | `@mgr 〜` / `@dev_m 〜` / `@dev_f 〜` / `@chat 〜` | その社員が応答する |
 | `@all 〜` | 全員が応答する（点呼など） |
-| `/task <タイトル>` | タスクを投入（`POST /api/tasks` と同じ経路。mgr が計画→dev が実行） |
+| `/task [-d <作業先>] <タイトル>` | タスクを投入（`POST /api/tasks` と同じ経路。mgr が計画→dev が実行）。`-d`（`--dir`）で作業先を指定 |
 | `/say <本文>` | 質問の回答待ちでも `#会議室` へ通常発言する |
 | `/skip` / `/cancel` | 保留中の質問への回答をやめ、待機を解除する |
 | `/help` | コマンド一覧を表示 |
@@ -109,6 +109,7 @@ TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: 
 
 例: `おはよう` → 会議室に投稿され chat が応答。`@all 点呼です` → mgr / dev_m / dev_f / chat がそれぞれ応答。
 `/task ログイン画面を作る` → mgr が計画し dev_m / dev_f に割当て、worker が実行する。
+`/task -d /home/u/Dev/site 天気サイトを作る` → 作業先を指定して投入する（「タスクの作業先（workspace）を指定する」参照）。
 
 ### 在席（出退勤）
 
@@ -117,6 +118,7 @@ TUI は 4 ペイン（左: `社員` / `タスク`、中央: `#会議室`、右: 
 - `mgr` と `chat` は**サーバー常駐**でクライアント接続を持たない。起動直後から**常時在席**として
   扱い、heartbeat が無くても退勤にしない（`presence.Registry.MarkResident`。タイムアウトの Expire 対象外）。
 - `dev_m` / `dev_f` は**worker 接続**で出勤し、切断（または `OFFICE_HEARTBEAT_TIMEOUT` 超過）で退勤する。
+  同じ社員 ID の worker が重複接続すると、新しい接続で古い接続を自動的に閉じる（在席は維持し、誤った退勤にしない）。
 
 ## 手動で起動する
 
@@ -166,9 +168,32 @@ worker の実行モード:
 - **local**: `{"actions":[{"op":"read|write|list|exec",...}]}` をワークスペース内で実行。
   パスはワークスペース外へ出られない（`..` や絶対パスは拒否）。`exec` は `.env` の
   `OFFICE_ALLOW_EXEC=1` で許可（コードの書き込みだけなら不要、実行までするなら必要）。
+  `args` が空で `cmd` がシェル風の 1 行コマンド（空白や `&&` 等を含む）のときは `sh -c` で実行する。
 - **remote**: GitHub REST API でブランチ作成 → コミット → PR 作成。サーバーが発行した
   短命の installation token を `task_assign` の payload で受け取る。worker がオフラインの
   ときはサーバー側（`gh`）が PR を作る。
+
+## タスクの作業先（workspace）を指定する
+
+既定では worker の local 作業ディレクトリは `OFFICE_WORKSPACE` 固定で、`/home/user/Dev/site`
+のような特定プロジェクトを作業先にできず「workspace 外のパスは拒否されました」で失敗していた。
+タスクごとに作業先を指定できる。
+
+- **TUI**: `/task -d <作業先> <タイトル>`（`-d` は `--dir` も可）。
+  例: `/task -d /home/u/Dev/site 天気サイトを作る`
+- **TUI（絶対パスの自動抽出）**: タイトル（または説明）に絶対パスを書くと、それを作業先として扱う。
+  例: `/task /home/u/Dev/siteに天気サイトを作って`
+- **API**: `POST /api/tasks` の `workspace` フィールド。
+
+```sh
+curl -X POST http://127.0.0.1:8787/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"天気サイトを作る","from":"owner","workspace":"/home/u/Dev/site"}'
+```
+
+安全のため `OFFICE_ALLOWED_ROOTS`（`:` 区切りの許可ディレクトリ）内だけを許可する。
+`OFFICE_WORKSPACE` 自体も常に許可される。許可外の作業先は拒否され、worker 側で canonicalize
+後に前方一致で最終検証される。`workspace` 未指定なら従来どおり `OFFICE_WORKSPACE` を使う。
 
 ## 質問と回答（エスカレーション）
 
@@ -187,6 +212,21 @@ POST /api/tasks
 - オーナー（TUI）が接続していないときは質問せず即フォールバックし、そのまま作業を続ける
   （長時間ブロックしてタスクが滞留するのを避ける）。
 - 回答待ちの上限は `OFFICE_ANSWER_TIMEOUT`（既定 `3m`）。超過すると回答なしとして続行する。
+
+## エージェントの自律実行と自発活動
+
+- **dev の反復実行**: dev は「LLM に次の一手を聞く → worker で実行 → 結果を踏まえて次を聞く」を、
+  LLM が `{"done":true,...}` を返すまで繰り返してタスクを完了する（plan → execute → observe）。
+  上限は `OFFICE_MAX_AGENT_TURNS`（既定 8）と `OFFICE_TOKEN_BUDGET`（既定 20000）。
+  初回の応答が解釈できないモデルは従来どおり単発実行にフォールバックする。
+  remote モードは従来どおり単発で、反復しない。
+- **worker の耐性**: local 実行で個々のアクションが失敗しても（例: 存在しないファイルの `read`）、
+  全体を止めず最後まで実行して集約する。1 件も成功しなかった場合のみ `failed` になる。
+- **自発活動**: `OFFICE_INITIATIVE_CRON`（既定 `*/10 * * * *`、`off` で無効）の間隔で、各エージェントが
+  オフィスの状況（在席・直近の発言・最近のタスク）をもとに**自発的に発言**する。
+  特にすることが無ければ何も発言しない。本文の先頭に `@mgr` / `@dev_m` / `@dev_f` / `@chat` を付けた場合は
+  その社員が 1 往復で応答し、AI 同士が交流する（`@all` は他全員）。
+  オーナーが指示しなくても、進捗共有や声かけが行われる。
 
 ## 関係値と雑談（Phase 4）
 
@@ -395,7 +435,9 @@ check-in/out、タスク遷移、say、cron、ERROR/WARN、panic を集計し PA
 | `OFFICE_PAYROLL_CRON` | `0 9 * * *` | 日割り給与の cron（`@every 5s` も可） |
 | `OFFICE_PAYROLL_TZ` | `Asia/Tokyo` | cron のタイムゾーン |
 | `OFFICE_CHAT_CRON` | `0 * * * *` | 雑談 cron（`off` で無効） |
+| `OFFICE_INITIATIVE_CRON` | `*/10 * * * *` | 自発活動 cron（自律発言・AI 同士の交流。`off` で無効） |
 | `OFFICE_ANSWER_TIMEOUT` | `3m` | オーナーへの質問の回答を待つ上限（§16 エスカレーション） |
+| `OFFICE_ALLOWED_ROOTS` | （空） | タスクの作業先（`workspace`）に許可するディレクトリ（`:` 区切り）。空なら worker 側で `OFFICE_WORKSPACE` のみ許可 |
 | `OFFICE_LLM_PROVIDER` | `mock` | `mock` / `deepseek` / `anthropic` |
 | `OFFICE_LLM_MODEL` | プロバイダ既定 | モデル名（deepseek-chat / claude-3-5-haiku-latest） |
 | `OFFICE_LLM_TIMEOUT` | `120s` | 1 リクエストのタイムアウト |
@@ -408,13 +450,15 @@ check-in/out、タスク遷移、say、cron、ERROR/WARN、panic を集計し PA
 | `GITHUB_*` | （空） | 上記「GitHub 連携」を参照 |
 
 クライアント（worker / tui）は `OFFICE_SERVER_URL`（既定 `ws://127.0.0.1:8787/ws`）を使う。
-worker の追加設定:
+タスクの作業先（`workspace`）の許可ルートは worker が実際の境界を強制する（サーバー側は
+`OFFICE_ALLOWED_ROOTS` が設定されているときだけ事前に弾く）。worker の追加設定:
 
 | 変数 | 既定 | 説明 |
 | --- | --- | --- |
 | `OFFICE_EMPLOYEE_ID` | （必須） | 社員 ID（`dev_m` / `dev_f` / `mgr`） |
 | `OFFICE_DEVICE_ID` | hostname | 端末名 |
-| `OFFICE_WORKSPACE` | （空） | local モードで読み書きする作業ディレクトリ |
+| `OFFICE_WORKSPACE` | （空） | local モードで読み書きする作業ディレクトリ（常に許可ルートに含まれる） |
+| `OFFICE_ALLOWED_ROOTS` | （空） | タスクの作業先に指定できる許可ルート（`:` 区切り）。`OFFICE_WORKSPACE` 自体も常に許可 |
 | `OFFICE_SANDBOX` | `bwrap` | `bwrap` または `none` |
 | `OFFICE_ALLOW_EXEC` | `0` | `1` で `exec` アクションを許可 |
 | `OFFICE_GITHUB_API_URL` | `https://api.github.com` | remote モードの API ベース |
@@ -428,7 +472,7 @@ worker の追加設定:
 | GET | `/api/employees` | 社員一覧 + 在席状態 |
 | GET | `/api/ledger/:id` | 学の残高 |
 | GET | `/api/relationships/:id` | 関係値 |
-| POST | `/api/tasks` | オーナーからのタスク投入（`title`/`description`/`from`/`mode`/`repo`/`base_branch`） |
+| POST | `/api/tasks` | オーナーからのタスク投入（`title`/`description`/`from`/`mode`/`repo`/`base_branch`/`workspace`） |
 | GET | `/api/tasks` | タスク一覧（`?status=&limit=`） |
 | POST | `/api/chat` | オーナーの発言に chat 役が応答 |
 | GET | `/api/ledger` | 全社員の残高（Phase 5） |
@@ -445,5 +489,5 @@ worker の追加設定:
 - **Phase 2（完了）**: `task_assign`/`task_result` / worker Local モード（ファイル操作）/ bubblewrap サンドボックス / dev_m・dev_f エージェント（mgr が計画で担当を指名、無ければ負荷分散で割当 → レビュー）
 - **Phase 3（実装済み・要資格情報）**: GitHub App 認証（JWT → installation token）/ worker Remote モード（ブランチ → コミット → PR）/ webhook 署名検証 → タスク化 / worker 不在時のサーバー側 PR 作成
 - **Phase 4（完了）**: ペルソナ（既存 + chat 役）/ 関係値システム（タスク結果で変動）/ chat 役（Ollama なし）/ 雑談 cron / TUI のタスクペイン・入力行・スクロール・@宛先
-- **Phase 5（実装済み）**: 学の元帳/残高 API・格差の観察（観察のみ）・質問と回答のエスカレーション（dev → mgr → オーナー。TUI の `回答> ` で応答）
+- **Phase 5（実装済み）**: 学の元帳/残高 API・格差の観察（観察のみ）・質問と回答のエスカレーション（dev → mgr → オーナー。TUI の `回答> ` で応答）・自律実行（dev の反復ループ）・自発活動（`OFFICE_INITIATIVE_CRON`）
 - **次は Phase 6**: 労働運動トリガーの具体化・Web UI

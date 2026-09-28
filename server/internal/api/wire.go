@@ -148,6 +148,7 @@ type taskMsg struct {
 	Mode        string `json:"mode"`
 	Repo        string `json:"repo"`
 	BaseBranch  string `json:"base_branch"`
+	Workspace   string `json:"workspace"`
 }
 
 // questionMsg は担当者（dev）の疑問を mgr 経由でオーナーへ送る（§16 エスカレーション）。

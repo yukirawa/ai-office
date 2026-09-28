@@ -102,6 +102,31 @@ func (h *hub) broadcast(v any) {
 	}
 }
 
+// evictEmployee は指定社員として接続中のクライアントを閉じる（新しい接続で置き換える）。
+// except には置き換え元の新クライアントを渡し、自分自身は閉じない。
+// 同じ社員 ID の worker が二重に接続したままになると、古いプロセスにタスクが飛んで
+// 設定違い（例: OFFICE_ALLOW_EXEC 未設定）で失敗するため、明示的に切断する。
+func (h *hub) evictEmployee(employeeID string, except *client) {
+	h.mu.RLock()
+	var victims []*client
+	for c := range h.clients {
+		if c == except {
+			continue
+		}
+		if c.known && c.employeeID == employeeID {
+			victims = append(victims, c)
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range victims {
+		// Close は close ハンドシェイクを待つため、新接続をブロックしないよう goroutine で実行する。
+		victim := c
+		go func() {
+			_ = victim.conn.Close(websocket.StatusPolicyViolation, "replaced by a new connection")
+		}()
+	}
+}
+
 // hasClients は接続中のクライアントが 1 つ以上あるかを返す。
 func (h *hub) hasClients() bool {
 	h.mu.RLock()
@@ -167,6 +192,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	cl.known = info.known
 	// welcome の office.online に自分を含めるため、先に在席へ反映する。
 	if info.known {
+		// 同一社員の古い接続が残っていれば置き換える（旧 worker にタスクが飛ぶのを防ぐ）。
+		s.hub.evictEmployee(hello.EmployeeID, cl)
 		s.presence.CheckIn(hello.EmployeeID, hello.DeviceID)
 	}
 
@@ -192,7 +219,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	if info.known {
 		s.failWaiters(cl.employeeID, reason)
-		s.checkOut(ctx, cl.employeeID, info.name, reason)
+		// 同一社員の別接続がまだ在席なら、置き換え時の誤った退勤処理をしない。
+		if s.hub.byEmployee(cl.employeeID) == nil {
+			s.checkOut(ctx, cl.employeeID, info.name, reason)
+		} else {
+			s.log.Info("同一社員の別接続が在席のため退勤処理をスキップします", "employee_id", cl.employeeID)
+		}
 	}
 	_ = conn.Close(websocket.StatusNormalClosure, "")
 	s.log.Info("接続を終了しました", "employee_id", cl.employeeID, "reason", reason)
@@ -395,6 +427,7 @@ func (s *Server) readLoop(ctx context.Context, cl *client) string {
 				Mode:        tm.Mode,
 				Repo:        tm.Repo,
 				BaseBranch:  tm.BaseBranch,
+				Workspace:   tm.Workspace,
 			})
 			if err != nil {
 				s.sendError(cl, "task_failed", err.Error())

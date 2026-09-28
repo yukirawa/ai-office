@@ -39,12 +39,28 @@ const devLocalInstruction = `あなたは開発担当です。タスクを遂行
 // devRemoteInstruction は remote モード用の追加システムプロンプト。
 const devRemoteInstruction = `あなたは開発担当です。GitHub へ提出するファイルを JSON で指示してください。形式は {"files":[{"path":"...","content":"..."}]} です。`
 
+// devStepInstruction は反復ループ用のシステムプロンプト。
+// 実行結果を踏まえて「次に行うこと」だけを JSON で返させる（§16 の自律実行）。
+const devStepInstruction = `あなたは開発担当です。これまでの実行結果を踏まえ、次に行うことだけを JSON で答えてください。
+- 作業を進める: {"actions":[{"op":"write|read|list|exec",...}]}（複数可）
+- 完了した: {"done":true,"summary":"1行の要約"}
+- 情報が足りない: {"question":"確認したいこと"}
+ファイルを作る場合は必ず write を含めてください。既存の構成は list/read で確認し、無いファイルを読んで失敗したら別の手段に切り替えてください。`
+
 // planResult は LLM 応答から抽出した割当内容。local は Actions、remote は Files を使う。
 // Question が入っている場合は「情報不足でオーナーに確認したい」という意思表示（§16）。
+// Done が true の場合はタスク完了の申告。
 type planResult struct {
 	Actions  []Action     `json:"actions"`
 	Files    []RemoteFile `json:"files"`
 	Question string       `json:"question,omitempty"`
+	Done     bool         `json:"done,omitempty"`
+	Summary  string       `json:"summary,omitempty"`
+}
+
+// isEmpty はどの指示も含まれていない（＝解釈できなかった）かを返す。
+func (p planResult) isEmpty() bool {
+	return !p.Done && strings.TrimSpace(p.Question) == "" && len(p.Actions) == 0 && len(p.Files) == 0
 }
 
 // DevAgent は 1 体の開発担当 AI 社員を動かす。1 体 = 1 goroutine を想定する。
@@ -163,19 +179,7 @@ func (d *DevAgent) runTask(ctx context.Context, t Task) {
 	d.setState(StateThinking)
 	d.updateTask(ctx, t.ID, "working", "")
 
-	assign, guard := d.buildAssign(ctx, t)
-	if guard != "" {
-		d.logger().Warn("無限ループ防止ガードが作動しました",
-			"id", d.id,
-			"task_id", t.ID,
-			"guard", guard,
-			"max_turns", d.opts.MaxTurns,
-			"token_budget", d.opts.TokenBudget,
-		)
-	}
-
-	d.setState(StateWorking)
-	res := d.execute(ctx, t, assign)
+	res := d.work(ctx, t)
 	if res.TaskID == "" {
 		res.TaskID = t.ID
 	}
@@ -186,6 +190,204 @@ func (d *DevAgent) runTask(ctx context.Context, t Task) {
 		d.reviewer.Review(ctx, t, res)
 	}
 	d.setState(StateIdle)
+}
+
+// work はタスクを実行して結果を返す。remote は単発、local は LLM と対話しながら反復する（§16）。
+func (d *DevAgent) work(ctx context.Context, t Task) Result {
+	if strings.TrimSpace(t.Mode) == "remote" || d.client == nil {
+		// remote は PR 単位の単発実行。LLM が無いときも従来のフォールバック（レポート 1 件）にする。
+		assign, guard := d.buildAssign(ctx, t)
+		d.warnGuard(t, guard)
+		d.setState(StateWorking)
+		res := d.execute(ctx, t, assign)
+		if res.TaskID == "" {
+			res.TaskID = t.ID
+		}
+		return res
+	}
+	return d.localLoop(ctx, t)
+}
+
+// warnGuard は無限ループ防止ガードの作動をログに記録する。
+func (d *DevAgent) warnGuard(t Task, guard string) {
+	if guard == "" {
+		return
+	}
+	d.logger().Warn("無限ループ防止ガードが作動しました",
+		"id", d.id, "task_id", t.ID, "guard", guard,
+		"max_turns", d.opts.MaxTurns, "token_budget", d.opts.TokenBudget)
+}
+
+// localLoop は「LLM に次の一手を聞く → 実行する → 結果を渡して繰り返す」自律ループ（§16）。
+// 明示的な done、ターン上限、トークン予算で終了する。
+func (d *DevAgent) localLoop(ctx context.Context, t Task) Result {
+	observation := ""
+	lastSummary := ""
+	tokensUsed := 0
+
+	for round := 1; round <= d.opts.MaxTurns; round++ {
+		if err := ctx.Err(); err != nil {
+			return failedResult(t.ID, err)
+		}
+
+		step, used, err := d.planStep(ctx, t, observation)
+		tokensUsed += used
+		if err != nil {
+			d.logger().Warn("dev の計画 LLM 呼び出しに失敗しました",
+				"id", d.id, "task_id", t.ID, "round", round, "error", err)
+			break
+		}
+
+		// エージェント形式で応答しないモデル向けの後方互換: 初回が解釈不能なら従来の単発フォールバック。
+		if round == 1 && step.isEmpty() {
+			assign, guard := d.buildAssign(ctx, t)
+			d.warnGuard(t, guard)
+			d.setState(StateWorking)
+			res := d.execute(ctx, t, assign)
+			if res.TaskID == "" {
+				res.TaskID = t.ID
+			}
+			return res
+		}
+
+		switch {
+		case step.Done:
+			if s := strings.TrimSpace(step.Summary); s != "" {
+				lastSummary = s
+			}
+			if lastSummary == "" {
+				lastSummary = "作業を完了しました"
+			}
+			return Result{TaskID: t.ID, Status: "done", Summary: lastSummary, Detail: observation}
+
+		case strings.TrimSpace(step.Question) != "":
+			if answer, ok := d.escalate(ctx, t, step.Question); ok {
+				observation = appendObservation(observation, "オーナーの回答: "+answer)
+			}
+
+		case len(step.Actions) > 0:
+			assign := TaskAssign{
+				TaskID: t.ID, Mode: "local", Title: t.Title, Reason: t.Plan,
+				Workspace: t.Workspace, Actions: step.Actions,
+			}
+			d.setState(StateWorking)
+			res := d.execute(ctx, t, assign)
+			if s := strings.TrimSpace(res.Summary); s != "" {
+				lastSummary = s
+			}
+			observation = appendObservation(observation, formatObservation(res))
+
+		default:
+			if lastSummary == "" {
+				lastSummary = "進められる作業がありませんでした"
+			}
+			return Result{TaskID: t.ID, Status: "done", Summary: lastSummary, Detail: observation}
+		}
+
+		if tokensUsed > d.opts.TokenBudget {
+			d.logger().Warn("dev のトークン予算を超過しました",
+				"id", d.id, "task_id", t.ID, "tokens_used", tokensUsed)
+			break
+		}
+	}
+
+	if lastSummary == "" {
+		lastSummary = "ターン上限または予算超過で終了しました"
+	}
+	return Result{TaskID: t.ID, Status: "done", Summary: lastSummary, Detail: observation}
+}
+
+// planStep は「次の一手」を LLM に 1 回問い合わせて解釈する。
+func (d *DevAgent) planStep(ctx context.Context, t Task, observation string) (planResult, int, error) {
+	req := llm.Request{
+		Model:     d.opts.Model,
+		System:    d.stepSystemPrompt(),
+		Messages:  []llm.Message{{Role: "user", Content: stepPrompt(t, observation)}},
+		MaxTokens: d.opts.MaxTokens,
+	}
+	resp, err := d.client.Chat(ctx, req)
+	if err != nil {
+		return planResult{}, 0, err
+	}
+	used := resp.InputTokens + resp.OutputTokens
+	if parsed, ok := parseAssign(resp.Text); ok {
+		return parsed, used, nil
+	}
+	return planResult{}, used, nil
+}
+
+// stepSystemPrompt は反復ループ用のシステムプロンプトを組み立てる。
+func (d *DevAgent) stepSystemPrompt() string {
+	parts := make([]string, 0, 3)
+	if base := strings.TrimSpace(d.persona.SystemPrompt()); base != "" {
+		parts = append(parts, base)
+	}
+	parts = append(parts, devStepInstruction, devJSONOnlyInstruction)
+	return strings.Join(parts, "\n\n")
+}
+
+// stepPrompt は「次の一手」を問うユーザーメッセージを組み立てる。
+func stepPrompt(t Task, observation string) string {
+	var b strings.Builder
+	b.WriteString("次のタスクを進めてください。\n")
+	if t.Title != "" {
+		fmt.Fprintf(&b, "タイトル: %s\n", t.Title)
+	}
+	if t.Description != "" {
+		fmt.Fprintf(&b, "内容: %s\n", t.Description)
+	}
+	if t.From != "" {
+		fmt.Fprintf(&b, "依頼者: %s\n", t.From)
+	}
+	if p := strings.TrimSpace(t.Plan); p != "" {
+		fmt.Fprintf(&b, "mgr の計画: %s\n", p)
+	}
+	if ws := strings.TrimSpace(t.Workspace); ws != "" {
+		fmt.Fprintf(&b, "作業ディレクトリ: %s\n", ws)
+	}
+	if o := strings.TrimSpace(observation); o != "" {
+		b.WriteString("\nこれまでの実行結果:\n")
+		b.WriteString(truncateText(o, 4000))
+		b.WriteString("\n")
+	} else {
+		b.WriteString("\n(まだ作業を開始していません)\n")
+	}
+	b.WriteString("\n次に行うことだけを JSON で返してください。")
+	return b.String()
+}
+
+// appendObservation は観察ログを追記し、古い部分を切り詰めて長さを抑える。
+func appendObservation(prev, add string) string {
+	const maxObs = 6000
+	s := prev
+	if s != "" {
+		s += "\n---\n"
+	}
+	s += add
+	if r := []rune(s); len(r) > maxObs {
+		s = string(r[len(r)-maxObs:])
+	}
+	return s
+}
+
+// formatObservation はタスク結果を次の一手の材料になる形に整える。
+func formatObservation(res Result) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "実行結果: %s — %s", res.Status, res.Summary)
+	if d := strings.TrimSpace(res.Detail); d != "" {
+		b.WriteString("\n")
+		b.WriteString(d)
+	}
+	return b.String()
+}
+
+// truncateText は s を最大 n ルーンへ切り詰める。
+func truncateText(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // execute は worker へ割り当てて結果を待つ。remote で dispatch に失敗した場合は
@@ -253,10 +455,11 @@ func (d *DevAgent) buildAssign(ctx context.Context, t Task) (TaskAssign, string)
 			files = []RemoteFile{{Path: reportPath(t), Content: report}}
 		}
 		return TaskAssign{
-			TaskID: t.ID,
-			Mode:   "remote",
-			Title:  t.Title,
-			Reason: t.Plan,
+			TaskID:    t.ID,
+			Mode:      "remote",
+			Title:     t.Title,
+			Reason:    t.Plan,
+			Workspace: t.Workspace,
 			Remote: &RemoteSpec{
 				Repo:       t.Repo,
 				BaseBranch: baseBranch(t),
@@ -272,7 +475,7 @@ func (d *DevAgent) buildAssign(ctx context.Context, t Task) (TaskAssign, string)
 	if len(actions) == 0 {
 		actions = []Action{{Op: "write", Path: reportPath(t), Content: report}}
 	}
-	return TaskAssign{TaskID: t.ID, Mode: "local", Title: t.Title, Reason: t.Plan, Actions: actions}, guard
+	return TaskAssign{TaskID: t.ID, Mode: "local", Title: t.Title, Reason: t.Plan, Workspace: t.Workspace, Actions: actions}, guard
 }
 
 // escalate は担当者の疑問を mgr 経由でオーナーへ上げ、回答を待つ（§16）。
@@ -414,6 +617,22 @@ func (d *DevAgent) Converse(ctx context.Context, channel, prompt string) {
 	}
 	d.notifyChannel(ctx, channel, reply)
 	d.setState(StateIdle)
+}
+
+// Initiative は dev の自発行動（§16 自律）。気づきや提案、mgr への確認を行う。
+func (d *DevAgent) Initiative(ctx context.Context, brief string) string {
+	if d.State() != StateIdle {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, converseTimeout(d.opts))
+	defer cancel()
+
+	d.setState(StateThinking)
+	defer d.setState(StateIdle)
+
+	system := initiativeSystemPrompt(d.persona.SystemPrompt(), d.name, "開発担当")
+	text, _ := initiativeRun(ctx, d.client, d.logger(), d.id, d.opts.Model, system, brief, d.opts)
+	return text
 }
 
 // assignPrompt はタスクを LLM に渡すユーザーメッセージに整形する。

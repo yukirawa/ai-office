@@ -62,12 +62,12 @@ const MAX_STATUS_WIDTH: u16 = 28;
 const HINT_MAX_WIDTH: u16 = 60;
 /// 入力欄に最低限残す幅（プロンプト込み）。
 const INPUT_MIN_WIDTH: u16 = 16;
-/// `/task` にタイトルが無いときの使い方。
-const TASK_USAGE: &str = "使い方: /task <タイトル>";
+/// `/task` にタイトルが無いとき（または `-d` の値が無いとき）の使い方。
+const TASK_USAGE: &str = "使い方: /task [-d <作業先>] <タイトル>";
 /// `/help` の表示内容。
 const HELP_LINES: &[&str] = &[
     "コマンド:",
-    "  /task <タイトル>  タスクを依頼",
+    "  /task [-d <作業先>] <タイトル>  タスクを依頼（-d で作業ディレクトリ指定）",
     "  /help             このヘルプを表示",
     "  /quit, /exit      終了",
     "  /say <本文>       質問保留中でも #会議室 へ発言",
@@ -648,15 +648,20 @@ fn run_ui(
                             }
                         }
                         InputAction::TaskUsage => state.push_local(TASK_USAGE.to_string()),
-                        InputAction::Task(title) => {
+                        InputAction::Task { title, workspace } => {
                             // サーバーのエコーを待たずに即時フィードバックを出す。
-                            state.push_local(format!("> /task {title}"));
+                            if workspace.is_empty() {
+                                state.push_local(format!("> /task {title}"));
+                            } else {
+                                state.push_local(format!("> /task -d {workspace} {title}"));
+                            }
                             outgoing = Some(ClientMsg::Task {
                                 title,
                                 description: String::new(),
                                 mode: "local".to_string(),
                                 repo: String::new(),
                                 base_branch: String::new(),
+                                workspace,
                             });
                         }
                         // 発言・回答・スキップの振り分けは純粋関数 [`resolve_outgoing`] に集約し、
@@ -1158,8 +1163,12 @@ enum InputAction {
     Quit,
     /// ヘルプ表示。
     Help,
-    /// タスク投入（タイトル）。
-    Task(String),
+    /// タスク投入（タイトルと任意の作業先）。
+    Task {
+        title: String,
+        /// `-d <dir>` / `--dir <dir>` で指定した作業先。未指定なら空文字。
+        workspace: String,
+    },
     /// タイトル無しの `/task`。
     TaskUsage,
     /// #会議室 への発言（保留中の質問があれば回答として扱う）。
@@ -1172,7 +1181,7 @@ enum InputAction {
 
 /// 入力行の文字列を解釈する（§15.2）。
 ///
-/// - `/task <タイトル>` → [`InputAction::Task`]（タイトル必須）
+/// - `/task [-d <作業先>] <タイトル>` → [`InputAction::Task`]（タイトル必須）
 /// - `/help` / `/quit` / `/exit`
 /// - `/say <本文>` → [`InputAction::SayForced`]（保留中の質問があっても発言）
 /// - `/skip` / `/cancel` → [`InputAction::SkipQuestion`]
@@ -1216,19 +1225,48 @@ fn parse_input(input: &str) -> InputAction {
         match chars.next() {
             // `/task` 単体は上で処理済みだが、念のため。
             None => return InputAction::TaskUsage,
-            // `/task <タイトル>`（空白区切り）だけをコマンドとして扱う。
+            // `/task ...`（空白区切り）だけをコマンドとして扱う。
             Some(c) if c.is_whitespace() => {
-                let title = chars.as_str().trim();
-                if title.is_empty() {
+                let rest = chars.as_str().trim();
+                if rest.is_empty() {
                     return InputAction::TaskUsage;
                 }
-                return InputAction::Task(title.to_string());
+                return parse_task_args(rest);
             }
             // `/taskfoo` のような未知の語は発言として扱う。
             Some(_) => {}
         }
     }
     InputAction::Say(input.to_string())
+}
+
+/// `/task` の引数を解釈する。
+///
+/// `-d <dir>` / `--dir <dir>` を先頭に付けると作業先を指定できる（省略可）。
+/// 例: `/task -d /home/user/Dev/site 天気サイトを作る`
+/// `-d` に値が無い、または `-d` の後にタイトルが無い場合は使い方表示にする。
+fn parse_task_args(rest: &str) -> InputAction {
+    let mut tokens = rest.split_whitespace();
+    match tokens.next() {
+        Some("-d") | Some("--dir") => {
+            let Some(workspace) = tokens.next() else {
+                return InputAction::TaskUsage;
+            };
+            let title = tokens.collect::<Vec<_>>().join(" ");
+            if title.is_empty() {
+                return InputAction::TaskUsage;
+            }
+            InputAction::Task {
+                title,
+                workspace: workspace.to_string(),
+            }
+        }
+        // `-d` 無しはタイトル全体（空白はそのまま保持）。
+        _ => InputAction::Task {
+            title: rest.to_string(),
+            workspace: String::new(),
+        },
+    }
 }
 
 /// 入力アクションと保留中の質問から、送信するメッセージと更新後の保留を決める純粋関数。
@@ -1440,10 +1478,19 @@ mod tests {
     fn parse_input_commands_and_say() {
         assert_eq!(parse_input(""), InputAction::Empty);
         assert_eq!(parse_input("    "), InputAction::Empty);
-        assert_eq!(parse_input("/task x"), InputAction::Task("x".to_string()));
+        assert_eq!(
+            parse_input("/task x"),
+            InputAction::Task {
+                title: "x".to_string(),
+                workspace: String::new(),
+            }
+        );
         assert_eq!(
             parse_input("/task   レポート作成"),
-            InputAction::Task("レポート作成".to_string())
+            InputAction::Task {
+                title: "レポート作成".to_string(),
+                workspace: String::new(),
+            }
         );
         assert_eq!(parse_input("/task"), InputAction::TaskUsage);
         assert_eq!(parse_input("/task   "), InputAction::TaskUsage);
@@ -1463,6 +1510,38 @@ mod tests {
         assert_eq!(
             parse_input("/taskfoo"),
             InputAction::Say("/taskfoo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_task_with_dir_flag() {
+        // `-d <dir>` で作業先を指定でき、title には残りが入る。
+        assert_eq!(
+            parse_input("/task -d /home/user/Dev/site 天気サイトを作る"),
+            InputAction::Task {
+                title: "天気サイトを作る".to_string(),
+                workspace: "/home/user/Dev/site".to_string(),
+            }
+        );
+        // `--dir` 长音も受け付ける。
+        assert_eq!(
+            parse_input("/task --dir /tmp/x レポート"),
+            InputAction::Task {
+                title: "レポート".to_string(),
+                workspace: "/tmp/x".to_string(),
+            }
+        );
+        // `-d` の値が無い、またはタイトルが無い場合は使い方表示。
+        assert_eq!(parse_input("/task -d"), InputAction::TaskUsage);
+        assert_eq!(parse_input("/task --dir"), InputAction::TaskUsage);
+        assert_eq!(parse_input("/task -d /tmp/x"), InputAction::TaskUsage);
+        // `-d` 無しは従来どおり workspace は空。
+        assert_eq!(
+            parse_input("/task レポート"),
+            InputAction::Task {
+                title: "レポート".to_string(),
+                workspace: String::new(),
+            }
         );
     }
 
@@ -2128,7 +2207,10 @@ mod tests {
             InputAction::Quit,
             InputAction::Help,
             InputAction::TaskUsage,
-            InputAction::Task("t".to_string()),
+            InputAction::Task {
+                title: "t".to_string(),
+                workspace: String::new(),
+            },
         ] {
             let (msg, pending) = resolve_outgoing(&action, Some("q-1"));
             assert_eq!(msg, None, "送信しない");

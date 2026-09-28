@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -215,6 +216,9 @@ type CreateTaskInput struct {
 	Mode        string // "local"（既定） | "remote"
 	Repo        string
 	BaseBranch  string
+	// Workspace は local モードの作業先ディレクトリ。空なら Title/Description 中の
+	// 絶対パスから自動抽出する（worker の許可ルートで検証される）。
+	Workspace string
 }
 
 // CreateTask はタスクを保存し、mgr の受信箱へ渡す。戻り値はタスク ID。
@@ -229,6 +233,18 @@ func (s *Server) CreateTask(ctx context.Context, in CreateTaskInput) (string, er
 	mode := strings.TrimSpace(in.Mode)
 	if mode == "" {
 		mode = "local"
+	}
+
+	// 作業先の決定: 明示指定 > タイトル/説明中の絶対パスから自動抽出。
+	workspace := strings.TrimSpace(in.Workspace)
+	if workspace == "" {
+		workspace = extractWorkspacePath(in.Title)
+		if workspace == "" {
+			workspace = extractWorkspacePath(in.Description)
+		}
+	}
+	if workspace != "" && !s.workspaceAllowed(workspace) {
+		return "", fmt.Errorf("api: 作業先が許可されていません: %s（OFFICE_ALLOWED_ROOTS に追加してください）", workspace)
 	}
 
 	id := uuid.NewString()
@@ -262,13 +278,74 @@ func (s *Server) CreateTask(ctx context.Context, in CreateTaskInput) (string, er
 		Mode:        mode,
 		Repo:        in.Repo,
 		BaseBranch:  in.BaseBranch,
+		Workspace:   workspace,
 	}); !ok {
 		return "", errors.New("api: mgr の受信箱が満杯です")
 	}
 
 	s.log.Info("タスクを受け付けました",
-		"task_id", id, "title", in.Title, "from", in.From, "mode", mode, "repo", in.Repo)
+		"task_id", id, "title", in.Title, "from", in.From, "mode", mode, "repo", in.Repo, "workspace", workspace)
 	return id, nil
+}
+
+// workspaceAllowed は作業先が許可ルート内かを判定する。許可ルート未設定なら true
+// （worker 側の OFFICE_ALLOWED_ROOTS / OFFICE_WORKSPACE で最終検証される）。
+func (s *Server) workspaceAllowed(path string) bool {
+	roots := s.cfg.AllowedRoots
+	if len(roots) == 0 {
+		return true
+	}
+	clean := filepath.Clean(path)
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		if clean == root || strings.HasPrefix(clean, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractWorkspacePath は文字列中で最初に現れる「絶対パスらしきトークン」を返す。
+// URL の "://" は誤検出しない。見つからなければ ""。
+// 例: "/home/u/Dev/siteに、天気..." -> "/home/u/Dev/site"。
+func extractWorkspacePath(s string) string {
+	r := []rune(s)
+	for i := 0; i+1 < len(r); i++ {
+		if r[i] != '/' {
+			continue
+		}
+		if i > 0 {
+			prev := r[i-1]
+			// "https://" や相対パスの一部を誤検出しない。
+			if prev == ':' || prev == '/' || isPathRune(prev) {
+				continue
+			}
+		}
+		if !isPathRune(r[i+1]) {
+			continue
+		}
+		j := i + 1
+		for j < len(r) && (isPathRune(r[j]) || r[j] == '/') {
+			j++
+		}
+		cand := strings.TrimRight(string(r[i:j]), "/")
+		if len(cand) > 1 {
+			return cand
+		}
+	}
+	return ""
+}
+
+// isPathRune は絶対パスの構成文字（英数字と . _ -）かを返す。
+func isPathRune(c rune) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '.' || c == '_' || c == '-':
+		return true
+	default:
+		return false
+	}
 }
 
 // handleListTasks はタスク一覧を返す（検証用の拡張。?status=&limit=）。

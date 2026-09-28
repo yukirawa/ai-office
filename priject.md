@@ -235,6 +235,9 @@ agents パッケージ：
 Inbox からタスク受信 → think → work → report → idle を繰り返す。
 Context の Done で終了。
 
+dev の local 実行は、このループ内で plan（次の一手を LLM に問う）→ execute（worker で実行）
+→ observe（結果を次の問いに渡す）を `{"done":true}` まで反復する（§16.6）。
+
 無限ループ防止（必須）：
 - 最大ターン数
 - 予算上限（トークン数）
@@ -482,10 +485,14 @@ CIは最初は入れない。Phase 2 まで来たら GitHub Actions で go test 
      "mode":"local",
      "title":"...",
      "reason":"mgr の計画や意図",
+     "workspace":"/home/u/Dev/site",
      "actions":[{"op":"write","path":"reports/x.md","content":"..."}]
   }}
   ```
   `mode` は `local`（ファイル操作・コマンド） | `remote`（GitHub API）。
+  - `local` の任意フィールド `workspace`: 作業先ディレクトリ（空なら worker の `OFFICE_WORKSPACE`）。
+    worker が `OFFICE_ALLOWED_ROOTS`（+ `OFFICE_WORKSPACE`）に対して canonicalize 後に前方一致で
+    検証し、許可外は拒否する。
   - `local` の `actions[]`: `{"op":"read|write|list|exec", ...}`。
     `write` は `path`+`content`、`exec` は `cmd`+`args`+`cwd`。
   - `remote` の `remote`: `{"repo","base_branch","branch","title","body","files":[{"path","content"}],"token"}`。
@@ -566,9 +573,10 @@ Phase 0 の TUI は read-only だったため、クライアント画面から�
   chat 役がいればその発言を chat に渡して応答させる。
 - `task` — タスク投入（`POST /api/tasks` と同じ経路）。
   ```json
-  {"type":"task","title":"...","description":"...","mode":"local","repo":"","base_branch":""}
+  {"type":"task","title":"...","description":"...","mode":"local","repo":"","base_branch":"","workspace":""}
   ```
-  `title` は必須。サーバーは `CreateTask` して mgr に渡す。
+  `title` は必須。`workspace` は local の作業先（任意。空ならタイトル／説明の絶対パスを自動抽出）。
+  サーバーは `CreateTask` して mgr に渡す。TUI からは `/task -d <作業先> <タイトル>` で指定できる。
 
 ### 15.2 TUI の操作
 
@@ -637,6 +645,17 @@ Phase 0 の TUI は read-only だったため、クライアント画面から�
 - TUI の入力ルーティング: 保留中の質問（`回答> `）があっても、`@` または `/` で始まる入力は
   回答に飲み込まず通常会議室発言として送る。`@宛先` やコマンドが回答扱いになり
   「chat しか応答しない」ように見える問題を避けるためで、保留は解除せずそのまま残す。
+- タスクごとの作業先（`workspace`）を指定できるようにした。`task_assign` payload /
+  `POST /api/tasks` の `workspace`、TUI の `/task -d <作業先>` で渡す。許可範囲は
+  `OFFICE_ALLOWED_ROOTS`（`:` 区切り）で、`OFFICE_WORKSPACE` 自体も常に含める。サーバーは
+  `OFFICE_ALLOWED_ROOTS` 設定時に事前チェックし、worker が canonicalize 後に前方一致で最終検証する。
+- タイトル／説明に絶対パスが含まれるとき、それを作業先として自動抽出する（`extractWorkspacePath`。
+  URL の `://` は誤検出しない。例: `/home/u/Dev/siteに、天気...` → `/home/u/Dev/site`）。
+- 同一社員 ID の重複接続は、新しい接続で古い接続を閉じて置き換える（`hub.evictEmployee`）。
+  置き換えで閉じた旧接続は、同社員の別接続がまだ在席なら退勤処理をスキップし、誤った退勤にしない。
+- `exec` の改善: `args` が空で `cmd` がシェル風の 1 行コマンド（空白や `&&` 等のメタ文字を含む）
+  のときは `sh -c` で実行する（LLM がその形式を出しやすいため）。`OFFICE_ALLOW_EXEC=1` が
+  必要な点は変わらない。
 
 ### 16.5 質問と回答（エスカレーション）
 
@@ -681,3 +700,30 @@ wire（§4.2 / §15 の type 拡張）:
   `dev_f`）を名指ししていればそれを選び、無ければこれまでの担当件数が少ない方へ割り当てる
   （`Manager.nextAssignee`。旧ラウンドロビン固定を置換）。worker 未接続の dev に割り当てて
   失敗するのを減らすため、オンライン優先を先に見る（presence 未登録なら従来どおり全員を候補にする）。
+
+### 16.6 自律実行と自発活動
+
+§0 の裁量拡張として、エージェントの自律実行（dev の反復ループ）と自発活動（自律発言・AI 同士の交流）を追加した。
+
+- **dev の反復ループ**: `DevAgent.work` の local 実行を、従来の「1 回計画 → 1 回実行」から
+  `DevAgent.localLoop`（`planStep` / `stepPrompt`）に置き換えた。「次の一手」を LLM に 1 回問い合わせ、
+  返ってきた JSON を解釈して worker で実行し、その結果（observation）を次の問い合わせに渡す、を繰り返す。
+  - JSON 契約: `{"actions":[{"op":"write|read|list|exec",...}]}`（作業を進める）/
+    `{"done":true,"summary":"..."}`（完了）/ `{"question":"..."}`（情報不足。mgr 経由でオーナーへ
+    エスカレーションし、回答を observation に足して続行。§16.5）。
+  - 上限: `OFFICE_MAX_AGENT_TURNS`（`MaxTurns`、既定 8）と `OFFICE_TOKEN_BUDGET`（`TokenBudget`、既定 20000）。
+    `{"actions"}` も `{"question"}` も無い応答や上限到達では、直前の要約で `done` として終了する。
+  - 初回の応答が解釈不能（`planStep` が空）のときは、従来の単発実行（`buildAssign` → `execute`）に
+    フォールバックする（エージェント形式を返さないモデル向けの後方互換）。
+  - remote モードは従来どおり単発（反復しない）。
+- **worker の非致命アクション失敗**: local 実行（`client/crates/worker/src/local.rs`）で、個々の
+  アクションの失敗（例: 存在しないファイルの `read`）は全体を止めず `WARN` として記録し、最後まで
+  実行して集約する。1 件も成功しなかった場合のみ `failed` を返す（探索中の `read` 失敗を許容するため）。
+- **自発活動**: `OFFICE_INITIATIVE_CRON`（既定 `*/10 * * * *`、`off` で無効）の cron から
+  `api.Server.RunInitiative` が呼ばれ、各エージェントに `officeBrief`（在席・直近の発言・最近のタスク）を
+  渡して自発的な発言を 1 つ生成させる。生成は `agents.InitiativeAgent`（`Initiative(ctx, brief) string`）を
+  実装したエージェントが行い、空文字なら何も発言しない。
+  - 生成された発言は `#会議室` へ投稿し、本文先頭が `@id` のときはその社員へ会話を 1 往復だけ振る
+    （`routeAgentMention`）。相手の返答は通常の `Converse`（1 往復）で、そこからさらに連鎖しない
+    （**深さ 1**）。`@all` は発言者以外の全員へ振る。
+  - これにより、オーナーが指示しなくても進捗共有や声かけが自発的に行われる。

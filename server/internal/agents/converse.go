@@ -20,6 +20,13 @@ type Agent interface {
 	Converser
 }
 
+// InitiativeAgent は自発的な発言を生成できる（§16 自律）。
+// 返したテキストの投稿・宛先振り分けは呼び出し側（api）が行う。
+type InitiativeAgent interface {
+	// Initiative はオフィスの状況 brief から、自発的な発言（無ければ空文字）を返す。
+	Initiative(ctx context.Context, brief string) string
+}
+
 // 3 種のエージェントが Agent を満たすことをコンパイル時に保証する。
 var (
 	_ Agent = (*Manager)(nil)
@@ -54,6 +61,53 @@ func buildConverseSystemPrompt(base, name string) string {
 		return instr
 	}
 	return base + "\n\n" + instr
+}
+
+// initiativeInstruction は自発発言用の追加システムプロンプト（§16 自律）。
+func initiativeInstruction(name, role string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "AI 社員"
+	}
+	role = strings.TrimSpace(role)
+	if role == "" {
+		role = "AI 社員"
+	}
+	return fmt.Sprintf(
+		"あなたは「%s」（%s）です。オフィスの状況を踏まえ、自発的に次にすること 1 つを決めてください。"+
+			"発言するときは #会議室 へそのまま流す日本語の短い文（1〜2 文）だけを返してください。"+
+			"誰かに依頼・確認・雑談を振るときは本文の先頭に @mgr / @dev_m / @dev_f / @chat のいずれかを付けます。"+
+			"特にすることが無ければ空文字だけを返してください。JSON や説明は不要です。",
+		name, role)
+}
+
+// initiativeSystemPrompt はペルソナのシステムプロンプトに自発発言の指示を足して返す。
+func initiativeSystemPrompt(base, name, role string) string {
+	base = strings.TrimSpace(base)
+	instr := initiativeInstruction(name, role)
+	if base == "" {
+		return instr
+	}
+	return base + "\n\n" + instr
+}
+
+// initiativeRun は自発発言の LLM 呼び出しを 1 回行い、整形したテキストを返す。
+func initiativeRun(ctx context.Context, client llm.Client, logger *slog.Logger, id, model, system, brief string, opts Options) (string, bool) {
+	text, ok := converseRun(ctx, client, logger, id, model, system, brief, opts)
+	if !ok {
+		return "", false
+	}
+	return normalizeInitiative(sanitizeChatReply(text)), true
+}
+
+// normalizeInitiative は「特に無し」を表す返答を空文字に正規化する。
+func normalizeInitiative(text string) string {
+	t := strings.TrimSpace(text)
+	switch t {
+	case "", "なし", "特になし", "無し", "何もしない", "none", "None", "N/A", "-":
+		return ""
+	}
+	return t
 }
 
 // converseTimeout は Converse 1 回の上限時間を決める。

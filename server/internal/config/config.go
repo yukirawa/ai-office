@@ -22,6 +22,7 @@ const (
 	defaultPayrollCron      = "0 9 * * *"
 	defaultPayrollTimezone  = "Asia/Tokyo"
 	defaultChatCron         = "0 * * * *"
+	defaultInitiativeCron   = "*/10 * * * *"
 	defaultAnswerTimeout    = 3 * time.Minute
 	defaultLLMProvider      = "mock"
 	defaultLLMModel         = "claude-3-5-haiku-latest"
@@ -71,8 +72,14 @@ type Config struct {
 	PayrollTimezone string
 	// ChatCron は雑談 cron 式（env OFFICE_CHAT_CRON）。"off" で無効（§8 4.4）。
 	ChatCron string
+	// InitiativeCron は自発活動 cron 式（env OFFICE_INITIATIVE_CRON）。"off" で無効（§16 自律）。
+	InitiativeCron string
 	// AnswerTimeout はオーナーへの質問の回答を待つ上限（env OFFICE_ANSWER_TIMEOUT、§16）。
 	AnswerTimeout time.Duration
+	// AllowedRoots は worker が local モードで作業を許可されるディレクトリ群
+	// （env OFFICE_ALLOWED_ROOTS、":" 区切り）。タスクの作業先（workspace）検証と
+	// タイトルからの自動抽出に使う。
+	AllowedRoots []string
 	// LLMProvider は "mock" または "anthropic"（env OFFICE_LLM_PROVIDER）。
 	LLMProvider string
 	// LLMModel は LLM のモデル名（env OFFICE_LLM_MODEL）。
@@ -200,7 +207,9 @@ func Load() (*Config, error) {
 		PayrollCron:          stringEnv("OFFICE_PAYROLL_CRON", defaultPayrollCron),
 		PayrollTimezone:      stringEnv("OFFICE_PAYROLL_TZ", defaultPayrollTimezone),
 		ChatCron:             stringEnv("OFFICE_CHAT_CRON", defaultChatCron),
+		InitiativeCron:       stringEnv("OFFICE_INITIATIVE_CRON", defaultInitiativeCron),
 		AnswerTimeout:        answerTimeout,
+		AllowedRoots:         splitList(os.Getenv("OFFICE_ALLOWED_ROOTS")),
 		LLMProvider:          provider,
 		LLMModel:             model,
 		LLMTimeout:           llmTimeout,
@@ -234,6 +243,11 @@ func (c *Config) ChatCronEnabled() bool {
 	return cronEnabled(c.ChatCron)
 }
 
+// InitiativeCronEnabled は自発活動 cron が有効かを返す。
+func (c *Config) InitiativeCronEnabled() bool {
+	return cronEnabled(c.InitiativeCron)
+}
+
 // PayrollCronEnabled は日割り給与 cron が有効かを返す。空文字・"off"/"none"/"disabled" は無効。
 func (c *Config) PayrollCronEnabled() bool {
 	return cronEnabled(c.PayrollCron)
@@ -260,6 +274,20 @@ func stringEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitList は ":" 区切りの環境変数を分解し、空要素と前後の空白を除いて返す。
+// 例: "/home/a:/home/b" -> ["/home/a", "/home/b"]。
+func splitList(v string) []string {
+	parts := strings.Split(v, ":")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // intEnv は整数の環境変数を読む。空文字・未設定なら既定値。

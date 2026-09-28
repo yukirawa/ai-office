@@ -119,6 +119,22 @@ func (c *ChatAgent) Converse(ctx context.Context, channel, prompt string) {
 	c.respond(ctx, channel, prompt)
 }
 
+// Initiative は chat 役の自発行動（§16 自律）。雑談や気づきを気軽に投げる。
+func (c *ChatAgent) Initiative(ctx context.Context, brief string) string {
+	if c.State() != StateIdle {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, converseTimeout(c.opts))
+	defer cancel()
+
+	c.setState(StateThinking)
+	defer c.setState(StateIdle)
+
+	system := initiativeSystemPrompt(c.persona.SystemPrompt(), c.name, "雑談・雑用")
+	text, _ := initiativeRun(ctx, c.client, c.logger(), c.id, c.opts.Model, system, brief, c.opts)
+	return text
+}
+
 // respond はチャンネルへ 1 往復の会話応答を返す。handlePrompt と Converse が共有する。
 // 無限ループ防止（最大ターン数・トークン予算）と終端判定は converseRun に集約している（§6.3）。
 func (c *ChatAgent) respond(ctx context.Context, channel, prompt string) {

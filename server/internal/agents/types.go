@@ -12,6 +12,7 @@ type Task struct {
 	Mode        string // "local" (default) | "remote"
 	Repo        string // remote モードの対象リポジトリ "owner/name"
 	BaseBranch  string // remote モードのベースブランチ
+	Workspace   string // local モードの作業先ディレクトリ（空なら worker の OFFICE_WORKSPACE）
 	Plan        string // mgr が立てた計画（dev に渡る）
 }
 
@@ -48,12 +49,13 @@ type RemoteSpec struct {
 // TaskID は Dispatch / Await の相関に使う内部用フィールドで、payload には含めない
 // （task_id は task_assign メッセージ直下のフィールドとして api が付与する）。
 type TaskAssign struct {
-	TaskID  string      `json:"-"`
-	Mode    string      `json:"mode"`
-	Title   string      `json:"title"`
-	Reason  string      `json:"reason,omitempty"`
-	Actions []Action    `json:"actions,omitempty"`
-	Remote  *RemoteSpec `json:"remote,omitempty"`
+	TaskID    string      `json:"-"`
+	Mode      string      `json:"mode"`
+	Title     string      `json:"title"`
+	Reason    string      `json:"reason,omitempty"`
+	Workspace string      `json:"workspace,omitempty"`
+	Actions   []Action    `json:"actions,omitempty"`
+	Remote    *RemoteSpec `json:"remote,omitempty"`
 }
 
 // Result は worker の実行結果（§13.1 の task_result 相当）。

@@ -661,6 +661,22 @@ func (m *Manager) Converse(ctx context.Context, channel, prompt string) {
 	m.setState(StateIdle)
 }
 
+// Initiative は mgr の自発行動（§16 自律）。滞留・未割当の確認や声かけを行う。
+func (m *Manager) Initiative(ctx context.Context, brief string) string {
+	if m.State() != StateIdle {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, converseTimeout(m.opts))
+	defer cancel()
+
+	m.setState(StateThinking)
+	defer m.setState(StateIdle)
+
+	system := initiativeSystemPrompt(m.employee.Persona.SystemPrompt(), m.employee.Name, "管理職")
+	text, _ := initiativeRun(ctx, m.client, m.logger(), m.employee.ID, m.opts.Model, system, brief, m.opts)
+	return text
+}
+
 // setState は内部状態を更新し、Notifier に公開する。
 func (m *Manager) setState(s string) {
 	m.mu.Lock()

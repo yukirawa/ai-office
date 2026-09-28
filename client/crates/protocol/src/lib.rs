@@ -52,6 +52,9 @@ pub enum ClientMsg {
         repo: String,
         #[serde(default)]
         base_branch: String,
+        /// local モードの作業先ディレクトリ（任意）。空なら `OFFICE_WORKSPACE`。
+        #[serde(default)]
+        workspace: String,
     },
     /// 質問への回答（新機能）。`question_id` は [`ServerMsg::Question`] の `id`。
     Answer { question_id: String, text: String },
@@ -250,6 +253,9 @@ pub struct TaskAssignPayload {
     pub actions: Vec<Action>,
     #[serde(default)]
     pub remote: Option<RemoteSpec>,
+    /// local モードの作業先ディレクトリ（任意）。空なら `OFFICE_WORKSPACE`。
+    #[serde(default)]
+    pub workspace: String,
 }
 
 /// `task_result.artifacts[]`。書き込んだファイルとバイト数。
@@ -618,11 +624,31 @@ mod tests {
             mode: "local".to_string(),
             repo: String::new(),
             base_branch: String::new(),
+            workspace: String::new(),
         };
         let json = msg.to_json();
         assert_eq!(
             json,
-            r#"{"type":"task","title":"レポート作成","description":"","mode":"local","repo":"","base_branch":""}"#
+            r#"{"type":"task","title":"レポート作成","description":"","mode":"local","repo":"","base_branch":"","workspace":""}"#
+        );
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn task_workspace_is_serialized_and_parsed() {
+        // 作業先ディレクトリが JSON に出て、往復しても保たれる。
+        let msg = ClientMsg::Task {
+            title: "天気サイトを作る".to_string(),
+            description: String::new(),
+            mode: "local".to_string(),
+            repo: String::new(),
+            base_branch: String::new(),
+            workspace: "/home/user/Dev/some-site".to_string(),
+        };
+        let json = msg.to_json();
+        assert!(
+            json.contains(r#""workspace":"/home/user/Dev/some-site""#),
+            "{json}"
         );
         assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
     }
@@ -639,8 +665,26 @@ mod tests {
                 mode: String::new(),
                 repo: String::new(),
                 base_branch: String::new(),
+                workspace: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn task_assign_payload_workspace_round_trips() {
+        // `TaskAssignPayload` が workspace を読み書きできる。
+        let payload = TaskAssignPayload {
+            mode: "local".to_string(),
+            workspace: "/home/user/Dev/some-site".to_string(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["workspace"], "/home/user/Dev/some-site");
+        let back: TaskAssignPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(back.workspace, "/home/user/Dev/some-site");
+        // 省略時は空文字にフォールバックする。
+        let payload: TaskAssignPayload = serde_json::from_str(r#"{"mode":"local"}"#).unwrap();
+        assert_eq!(payload.workspace, "");
     }
 
     #[test]
@@ -729,6 +773,8 @@ mod tests {
         assert_eq!(payload.mode, "local");
         assert!(payload.actions.is_empty());
         assert!(payload.remote.is_none());
+        assert_eq!(payload.workspace, "");
         assert_eq!(TaskAssignPayload::default().mode, "");
+        assert_eq!(TaskAssignPayload::default().workspace, "");
     }
 }

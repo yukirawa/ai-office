@@ -283,6 +283,10 @@ func run() error {
 	chatScheduler := startChatCron(ctx, cfg, chat, logger)
 	defer chatScheduler.Stop()
 
+	// ---- 自発活動 cron（§16 自律。自発発言と AI 同士の交流） ----
+	initiativeScheduler := startInitiativeCron(ctx, cfg, srv, logger)
+	defer initiativeScheduler.Stop()
+
 	// ---- 格差の観察 cron（Phase 5.3、観察のみ） ----
 	inequalityScheduler := startInequalityCron(ctx, cfg, srv, logger)
 	defer inequalityScheduler.Stop()
@@ -478,6 +482,31 @@ func startInequalityCron(
 	}
 	c.Start()
 	logger.Info("格差観察 cron を開始しました", "cron", cfg.InequalityCron, "threshold", cfg.InequalityThreshold)
+	return c
+}
+
+// startInitiativeCron は自発活動 cron を開始する（§16 自律。自発発言と AI 同士の交流）。
+// OFFICE_INITIATIVE_CRON が off/空 なら登録しない。
+func startInitiativeCron(
+	ctx context.Context,
+	cfg *config.Config,
+	srv *api.Server,
+	logger *slog.Logger,
+) *cron.Cron {
+	c := cron.New()
+	if !cfg.InitiativeCronEnabled() {
+		logger.Info("自発活動 cron は無効です", "cron", cfg.InitiativeCron)
+		return c
+	}
+	_, err := c.AddFunc(cfg.InitiativeCron, func() {
+		srv.RunInitiative(ctx)
+	})
+	if err != nil {
+		logger.Error("自発活動 cron の登録に失敗しました", "cron", cfg.InitiativeCron, "error", err)
+		return c
+	}
+	c.Start()
+	logger.Info("自発活動 cron を開始しました", "cron", cfg.InitiativeCron)
 	return c
 }
 
