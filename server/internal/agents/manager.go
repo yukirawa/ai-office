@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -68,8 +69,10 @@ const (
 )
 
 // planningInstruction は mgr の計画フェーズ用の追加システムプロンプト。
-// 担当者を明記させることで、mgr が実際に仕事を割り振る（§16）。
-const planningInstruction = "あなたは管理職です。タスクの実行計画を短く日本語で述べ、担当者を dev_m か dev_f のどちらかに決めて「担当: dev_m」のように明記してください。実行はしないこと。"
+// 分担が必要なときは複数 dev に割り振れる JSON を返させる（§16.7）。
+const planningInstruction = "あなたは管理職です。タスクを複数の開発担当に分担させる場合は、次の JSON だけを返してください: " +
+	`{"summary":"計画の要約","subtasks":[{"title":"作業名","detail":"具体的な作業内容","assignee":"dev_m または dev_f"}]}。` +
+	"分担が不要なら日本語の短い計画文を返してください。実行はしないこと。"
 
 // continueInstruction は応答が終端でなかった場合に次のターンへ促す汎用文言。
 // mgr / dev で共有するため、計画に依存しない言い回しにする。
@@ -120,6 +123,7 @@ type Manager struct {
 	online        func(string) bool // 在席判定（nil なら全員を候補にする）
 	updater       TaskUpdater
 	rel           RelationshipUpdater
+	coord         TaskCoordinator // 親子タスクの作成・照会（§16.7）
 
 	mu    sync.RWMutex
 	state string
@@ -203,6 +207,20 @@ func (m *Manager) SetRelationships(u RelationshipUpdater) {
 	m.assignMu.Lock()
 	defer m.assignMu.Unlock()
 	m.rel = u
+}
+
+// SetTaskCoordinator は親子タスクの作成・照会（api）を設定する。構築後でも呼べる（§16.7）。
+func (m *Manager) SetTaskCoordinator(c TaskCoordinator) {
+	m.assignMu.Lock()
+	defer m.assignMu.Unlock()
+	m.coord = c
+}
+
+// coordinator は現在の TaskCoordinator を返す（未設定なら nil）。
+func (m *Manager) coordinator() TaskCoordinator {
+	m.assignMu.Lock()
+	defer m.assignMu.Unlock()
+	return m.coord
 }
 
 // SetOnlineFunc は在席判定関数を設定する。設定すると、割当時にオンラインの dev を優先する
@@ -525,10 +543,21 @@ func (m *Manager) handleTask(ctx context.Context, t Task) {
 	}
 
 	plan := strings.TrimSpace(lastText)
+	summary, subs, split := parseSubtasks(lastText)
+	if strings.TrimSpace(summary) != "" {
+		plan = strings.TrimSpace(summary)
+	}
 	if plan == "" {
 		plan = "(計画を生成できませんでした)"
 	}
 	m.notify(ctx, reportPrefix(t)+plan)
+
+	// 分担（プロジェクト分解）が指定されていれば複数 dev に割り当てる（§16.7）。
+	if split && len(subs) > 0 && m.coordinator() != nil {
+		m.dispatchSubtasks(ctx, t, plan, subs)
+		m.setState(StateIdle)
+		return
+	}
 
 	// 計画を dev に割り当てる（§13.3: pending → assigned）。
 	m.assignTask(ctx, t, plan)
@@ -568,6 +597,93 @@ func (m *Manager) assignTask(ctx context.Context, t Task, plan string) {
 	m.logger().Info("タスクを割り当てました", "task_id", t.ID, "assignee", assignee.ID())
 }
 
+// subtaskPlan は mgr の計画 JSON（分担ありの場合）。
+type subtaskPlan struct {
+	Summary  string `json:"summary"`
+	Subtasks []struct {
+		Title    string `json:"title"`
+		Detail   string `json:"detail"`
+		Assignee string `json:"assignee"`
+	} `json:"subtasks"`
+}
+
+// parseSubtasks は計画文から分担（subtasks）を取り出す。JSON でなければ ok=false。
+func parseSubtasks(text string) (summary string, subs []Subtask, ok bool) {
+	cand := extractJSONObject(text)
+	if cand == "" {
+		return "", nil, false
+	}
+	var p subtaskPlan
+	if err := json.Unmarshal([]byte(cand), &p); err != nil {
+		return "", nil, false
+	}
+	for _, s := range p.Subtasks {
+		title := strings.TrimSpace(s.Title)
+		if title == "" {
+			continue
+		}
+		subs = append(subs, Subtask{
+			Title:    title,
+			Detail:   strings.TrimSpace(s.Detail),
+			Assignee: strings.TrimSpace(s.Assignee),
+		})
+	}
+	if len(subs) == 0 {
+		return "", nil, false
+	}
+	return strings.TrimSpace(p.Summary), subs, true
+}
+
+// dispatchSubtasks は計画を複数の dev に分担させる（§16.7）。
+// 親タスクは全サブタスクの完了が集約されるまで working にする。
+func (m *Manager) dispatchSubtasks(ctx context.Context, t Task, plan string, subs []Subtask) {
+	c := m.coordinator()
+	if c == nil {
+		m.assignTask(ctx, t, plan)
+		return
+	}
+
+	m.updateTask(ctx, t.ID, "working", fmt.Sprintf("%d 件に分担中", len(subs)))
+	m.notify(ctx, fmt.Sprintf("【分担】プロジェクト「%s」を %d 件に分けて割り当てます。", taskLabel(t), len(subs)))
+
+	assigned := 0
+	for _, sub := range subs {
+		assignee := m.nextAssignee(sub.Assignee)
+		if assignee == nil {
+			m.notify(ctx, fmt.Sprintf("【分担】「%s」の担当者が見つかりませんでした。", sub.Title))
+			continue
+		}
+		subID, err := c.CreateSubtask(ctx, t, sub)
+		if err != nil {
+			m.logger().Error("サブタスクの作成に失敗しました", "task_id", t.ID, "error", err)
+			continue
+		}
+		child := t
+		child.ID = subID
+		child.Title = sub.Title
+		// 担当範囲を明示し、他担当のファイルまで作ってしまう重複を抑える。
+		child.Description = strings.TrimSpace(sub.Detail)
+		if child.Description != "" {
+			child.Description += "\n"
+		}
+		child.Description += "（このサブタスクの範囲だけを担当し、他の担当者のファイルは作成しないでください。）"
+		child.Plan = plan
+		child.Assignee = assignee.ID()
+		if !assignee.Post(child) {
+			m.updateTask(ctx, subID, "failed", "assignee inbox full")
+			continue
+		}
+		assigned++
+		m.logger().Info("サブタスクを割り当てました",
+			"parent", t.ID, "task_id", subID, "assignee", assignee.ID(), "title", sub.Title)
+	}
+
+	if assigned == 0 {
+		m.updateTask(ctx, t.ID, "failed", "no subtask assigned")
+		m.notify(ctx, fmt.Sprintf("【分担】「%s」を割り当てられませんでした。", taskLabel(t)))
+	}
+}
+
 // Review は dev の結果を承認し、タスクを done / failed へ遷移させる（§13.3）。
 // Reviewer インターフェースを実装する。
 func (m *Manager) Review(ctx context.Context, t Task, res Result) {
@@ -586,6 +702,46 @@ func (m *Manager) Review(ctx context.Context, t Task, res Result) {
 	m.updateTask(ctx, t.ID, status, res.Summary)
 	m.notify(ctx, fmt.Sprintf("【レビュー】タスク「%s」を %s としました: %s", taskLabel(t), label, res.Summary))
 	m.logger().Info("タスクをレビューしました", "task_id", t.ID, "status", status)
+
+	// 子タスクなら、兄弟の完了状況を集約して親プロジェクトを進める（§16.7）。
+	if c := m.coordinator(); c != nil {
+		if parentID, err := c.ParentTaskID(ctx, t.ID); err == nil && parentID != "" {
+			m.aggregateProject(ctx, c, parentID)
+		}
+	}
+}
+
+// aggregateProject は子タスクの完了状況から親タスク（プロジェクト）の状態を決める（§16.7）。
+// 全子完了で done、1 つでも失敗で failed、それ以外は進捗ログのみ。
+func (m *Manager) aggregateProject(ctx context.Context, c TaskCoordinator, parentID string) {
+	sts, err := c.SubtaskStatuses(ctx, parentID)
+	if err != nil {
+		m.logger().Warn("サブタスクの取得に失敗しました", "parent", parentID, "error", err)
+		return
+	}
+	if len(sts) == 0 {
+		return
+	}
+	total, done, failed := 0, 0, 0
+	for _, s := range sts {
+		total++
+		switch strings.TrimSpace(s.Status) {
+		case "done":
+			done++
+		case "failed":
+			failed++
+		}
+	}
+	switch {
+	case done == total:
+		m.updateTask(ctx, parentID, "done", fmt.Sprintf("全 %d サブタスク完了", total))
+		m.notify(ctx, fmt.Sprintf("【完了】プロジェクトの全サブタスク（%d 件）が完了しました。", total))
+	case failed > 0:
+		m.updateTask(ctx, parentID, "failed", fmt.Sprintf("%d/%d サブタスク失敗", failed, total))
+		m.notify(ctx, fmt.Sprintf("【要対応】プロジェクトで %d 件のサブタスクが失敗しました（完了 %d/%d）。", failed, done, total))
+	default:
+		m.logger().Info("プロジェクト進捗", "parent", parentID, "done", done, "total", total)
+	}
 }
 
 // adjustRelationships は Review の結果に応じて mgr と担当者の関係値を更新する。

@@ -111,3 +111,27 @@ type Escalator interface {
 type OwnerChannel interface {
 	AskOwner(ctx context.Context, q Question) error
 }
+
+// Subtask は mgr が切る子タスク（分担の単位、§16.7）。
+type Subtask struct {
+	Title    string
+	Detail   string
+	Assignee string // 希望担当（空なら mgr が負荷で選ぶ）
+}
+
+// TaskStatus は子タスクの状態（集約用の最小情報）。
+type TaskStatus struct {
+	ID     string
+	Status string
+}
+
+// TaskCoordinator は親子タスクの作成・照会（api が実装する任意実装、§16.7）。
+// mgr はこれを使ってプロジェクトを分解し、子タスクの完了を集約する。
+type TaskCoordinator interface {
+	// CreateSubtask は parent の子タスクを作成し、その ID を返す（割当・配送は mgr が行う）。
+	CreateSubtask(ctx context.Context, parent Task, sub Subtask) (string, error)
+	// SubtaskStatuses は parentID を親とする子タスクの状態一覧を返す。
+	SubtaskStatuses(ctx context.Context, parentID string) ([]TaskStatus, error)
+	// ParentTaskID は taskID の親タスク ID を返す（無ければ ""）。
+	ParentTaskID(ctx context.Context, taskID string) (string, error)
+}

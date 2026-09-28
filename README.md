@@ -156,12 +156,18 @@ curl http://127.0.0.1:8787/api/tasks?limit=5
 ```
 POST /api/tasks
   -> mgr: LLM で計画を立て #会議室 に投稿
-  -> mgr: オンライン優先で、計画が名指しした担当（無ければ負荷の少ない dev）に割当（tasks.status=assigned）
+  -> mgr: 計画が JSON（subtasks）なら分担（サブタスク化）→ 各 dev へ割当（tasks.parent_id に親 ID を記録）
+     ・全サブタスク done で親（プロジェクト）を done、1つでも failed で failed に集約し「要対応」を通知
+  -> mgr: 分担が不要なら、オンライン優先で計画が名指しした担当（無ければ負荷の少ない dev）に割当（tasks.status=assigned）
   -> dev: 計画を JSON アクションに変換して task_assign を送信（status=working）
   -> worker: OFFICE_WORKSPACE 内で実行（bubblewrap サンドボックス）
   -> worker: task_result を返す（status=review）
   -> mgr: レビューして done / failed
 ```
+
+mgr はプロジェクト管理・社員管理の役割も持つ。1 つのタスクを複数の dev に分担させる場合は、
+上の「分担（サブタスク化）→ 割当 → 完了集約」を行い、分担が不要なタスクは従来どおり 1 人の dev に割り当てる
+（詳細は「全員で分担（プロジェクト管理）」）。
 
 worker の実行モード:
 
@@ -194,6 +200,32 @@ curl -X POST http://127.0.0.1:8787/api/tasks \
 安全のため `OFFICE_ALLOWED_ROOTS`（`:` 区切りの許可ディレクトリ）内だけを許可する。
 `OFFICE_WORKSPACE` 自体も常に許可される。許可外の作業先は拒否され、worker 側で canonicalize
 後に前方一致で最終検証される。`workspace` 未指定なら従来どおり `OFFICE_WORKSPACE` を使う。
+
+## 全員で分担（プロジェクト管理）
+
+mgr はプロジェクト管理・社員管理の役割を持ち、1 つのタスクを複数の dev に分担させられる。
+分担が必要なとき、mgr は計画 LLM に分解させ、次の JSON が返ると**サブタスク**に切り分けて割り当てる。
+
+```json
+{"summary":"計画の要約","subtasks":[{"title":"作業名","detail":"作業内容","assignee":"dev_m か dev_f"}]}
+```
+
+- mgr は各サブタスクをタスクとして作成し（DB の `tasks.parent_id` に親タスク ID を記録）、
+  **オンライン優先・負荷分散**で dev に割り当てる（`assignee` の指名が無ければ負荷の少ない方へ）。
+- 各 dev は担当サブタスクだけを実行する（担当範囲を明示して、他の担当者のファイルを作る重複を抑える）。
+- 全サブタスクが完了すると mgr が親タスク（プロジェクト）を `done` に集約し、1 つでも失敗すると
+  `failed` にして「要対応」を通知する。
+- 分担が不要なタスクは従来どおり 1 人の dev に割り当てる。
+
+分担の例（`/task -d` で作業先を指定して全員に分担させる）:
+
+```sh
+/task -d /home/u/Dev/site サイトを全員で作って
+```
+
+**注意（共有作業先）**: 分担した全 dev が同じプロジェクトを作るには、**全員が同じ作業先を使う**必要がある。
+オーナーは `/task -d <プロジェクトdir> <タイトル>`（またはタイトルに絶対パス）で作業先を指定する。
+親タスクの作業先はサブタスクにも引き継がれるため、分担しても各 dev は同じ場所へ書き込む。
 
 ## 質問と回答（エスカレーション）
 
@@ -489,5 +521,5 @@ check-in/out、タスク遷移、say、cron、ERROR/WARN、panic を集計し PA
 - **Phase 2（完了）**: `task_assign`/`task_result` / worker Local モード（ファイル操作）/ bubblewrap サンドボックス / dev_m・dev_f エージェント（mgr が計画で担当を指名、無ければ負荷分散で割当 → レビュー）
 - **Phase 3（実装済み・要資格情報）**: GitHub App 認証（JWT → installation token）/ worker Remote モード（ブランチ → コミット → PR）/ webhook 署名検証 → タスク化 / worker 不在時のサーバー側 PR 作成
 - **Phase 4（完了）**: ペルソナ（既存 + chat 役）/ 関係値システム（タスク結果で変動）/ chat 役（Ollama なし）/ 雑談 cron / TUI のタスクペイン・入力行・スクロール・@宛先
-- **Phase 5（実装済み）**: 学の元帳/残高 API・格差の観察（観察のみ）・質問と回答のエスカレーション（dev → mgr → オーナー。TUI の `回答> ` で応答）・自律実行（dev の反復ループ）・自発活動（`OFFICE_INITIATIVE_CRON`）
+- **Phase 5（実装済み）**: 学の元帳/残高 API・格差の観察（観察のみ）・質問と回答のエスカレーション（dev → mgr → オーナー。TUI の `回答> ` で応答）・自律実行（dev の反復ループ）・自発活動（`OFFICE_INITIATIVE_CRON`）・全員で分担（プロジェクト管理。mgr がサブタスク化 → オンライン優先・負荷分散で割当 → 完了集約、`tasks.parent_id`）
 - **次は Phase 6**: 労働運動トリガーの具体化・Web UI

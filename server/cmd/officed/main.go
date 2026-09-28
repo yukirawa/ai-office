@@ -224,6 +224,8 @@ func run() error {
 	mgr.SetOnlineFunc(srv.IsEmployeeOnline)
 	// Phase 4.2: 関係値（persona.Service は agents.RelationshipUpdater を満たす）。
 	mgr.SetRelationships(persona.NewService(st))
+	// Phase 5.7: プロジェクトの分担（親子タスクの作成・集約）を有効化する。
+	mgr.SetTaskCoordinator(srv)
 	srv.SetManager(mgr)
 
 	// ---- GitHub 連携（Phase 3） ----

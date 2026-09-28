@@ -81,6 +81,11 @@ var migrations = [][]string{
 		`ALTER TABLE tasks ADD COLUMN repo TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE tasks ADD COLUMN base_branch TEXT NOT NULL DEFAULT ''`,
 	},
+	// v3: mgr の分担（サブタスク）用に親タスク ID を追加（§16.7）。
+	{
+		`ALTER TABLE tasks ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks (parent_id, created_at)`,
+	},
 }
 
 // migrate は未適用のマイグレーションを順に流す。

@@ -22,11 +22,13 @@ type Task struct {
 	Mode        string
 	Repo        string
 	BaseBranch  string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// ParentID は親タスク（プロジェクト）の ID。mgr が分担した子タスクのみ設定される。
+	ParentID  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
-const taskColumns = `id, title, description, status, assignee, created_by, result, mode, repo, base_branch, created_at, updated_at`
+const taskColumns = `id, title, description, status, assignee, created_by, result, mode, repo, base_branch, parent_id, created_at, updated_at`
 
 // InsertTask はタスクを追加する。CreatedAt / UpdatedAt がゼロ値なら現在時刻。
 func (s *Store) InsertTask(t Task) error {
@@ -44,9 +46,9 @@ func (s *Store) InsertTask(t Task) error {
 		t.Mode = "local"
 	}
 	if _, err := s.db.Exec(
-		`INSERT INTO tasks (`+taskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (`+taskColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.Title, t.Description, t.Status, t.Assignee, t.CreatedBy, t.Result,
-		t.Mode, t.Repo, t.BaseBranch,
+		t.Mode, t.Repo, t.BaseBranch, t.ParentID,
 		formatTime(t.CreatedAt), formatTime(t.UpdatedAt),
 	); err != nil {
 		return fmt.Errorf("store: insert task %s: %w", t.ID, err)
@@ -139,6 +141,29 @@ func (s *Store) Tasks(status string, limit int) ([]Task, error) {
 	return out, nil
 }
 
+// Subtasks は parentID を親とする子タスクを作成順（古い順）で返す。
+func (s *Store) Subtasks(parentID string) ([]Task, error) {
+	rows, err := s.db.Query(
+		`SELECT `+taskColumns+` FROM tasks WHERE parent_id = ? ORDER BY created_at ASC, id ASC`, parentID)
+	if err != nil {
+		return nil, fmt.Errorf("store: subtasks 取得: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]Task, 0, 8)
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: subtasks 走査: %w", err)
+	}
+	return out, nil
+}
+
 // scanTask は 1 行を Task に読み込む。
 func scanTask(sc scanner) (Task, error) {
 	var (
@@ -146,7 +171,8 @@ func scanTask(sc scanner) (Task, error) {
 		created, updated string
 	)
 	if err := sc.Scan(&t.ID, &t.Title, &t.Description, &t.Status, &t.Assignee,
-		&t.CreatedBy, &t.Result, &t.Mode, &t.Repo, &t.BaseBranch, &created, &updated); err != nil {
+		&t.CreatedBy, &t.Result, &t.Mode, &t.Repo, &t.BaseBranch, &t.ParentID,
+		&created, &updated); err != nil {
 		return Task{}, err
 	}
 	t.CreatedAt = parseTime(created)

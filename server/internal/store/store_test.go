@@ -328,3 +328,46 @@ func TestTasks(t *testing.T) {
 		t.Errorf("UpdateTask(nobody) err = %v, want sql.ErrNoRows", err)
 	}
 }
+
+func TestTaskSubtasksRoundTrip(t *testing.T) {
+	st := openTestStore(t)
+
+	parent := Task{ID: "p1", Title: "プロジェクト", Status: "working"}
+	if err := st.InsertTask(parent); err != nil {
+		t.Fatalf("InsertTask(parent): %v", err)
+	}
+	children := []Task{
+		{ID: "c1", Title: "A", Status: "pending", ParentID: parent.ID},
+		{ID: "c2", Title: "B", Status: "pending", ParentID: parent.ID},
+	}
+	for _, c := range children {
+		if err := st.InsertTask(c); err != nil {
+			t.Fatalf("InsertTask(%s): %v", c.ID, err)
+		}
+	}
+
+	// Subtasks は子タスクのみを返す。
+	subs, err := st.Subtasks(parent.ID)
+	if err != nil {
+		t.Fatalf("Subtasks: %v", err)
+	}
+	if len(subs) != 2 {
+		t.Fatalf("Subtasks(%s) = %d 件, want 2 件", parent.ID, len(subs))
+	}
+	for _, s := range subs {
+		if s.ParentID != parent.ID {
+			t.Errorf("subtask %s の ParentID = %q, want %q", s.ID, s.ParentID, parent.ID)
+		}
+	}
+
+	// 子タスクを読み直しても ParentID が保存されている。
+	for _, c := range children {
+		got, err := st.Task(c.ID)
+		if err != nil {
+			t.Fatalf("Task(%s): %v", c.ID, err)
+		}
+		if got.ParentID != parent.ID {
+			t.Errorf("Task(%s).ParentID = %q, want %q", c.ID, got.ParentID, parent.ID)
+		}
+	}
+}

@@ -727,3 +727,36 @@ wire（§4.2 / §15 の type 拡張）:
     （`routeAgentMention`）。相手の返答は通常の `Converse`（1 往復）で、そこからさらに連鎖しない
     （**深さ 1**）。`@all` は発言者以外の全員へ振る。
   - これにより、オーナーが指示しなくても進捗共有や声かけが自発的に行われる。
+
+### 16.7 全員で分担（プロジェクト管理）
+
+§0 の裁量拡張として、mgr にプロジェクト管理・社員管理の役割を持たせ、1 つのタスクを複数の dev に
+分担させる機構を追加した。
+
+- **mgr の役割**: プロジェクト（親タスク）の分解・割当・完了集約を担う。割当は**オンライン優先・負荷分散**
+  （`Manager.nextAssignee`。在席中の dev を優先し、計画の指名が無ければ負荷の少ない方へ割り当てる）。
+- **計画 JSON 契約**: mgr の計画フェーズ（`planningInstruction`）で、分担が必要なときは次の JSON だけを
+  返させる。分担が不要なら従来どおり日本語の計画文を返し、1 人の dev に割り当てる。
+  ```json
+  {"summary":"計画の要約","subtasks":[{"title":"作業名","detail":"作業内容","assignee":"dev_m または dev_f"}]}
+  ```
+- **実装（mgr）**: `Manager.handleTask` が `parseSubtasks` で計画文から `summary` / `subtasks` を取り出し
+  （JSON でなければ従来の単発割当へ）、分担ありなら `Manager.dispatchSubtasks` で各サブタスクを切り、
+  `Manager.Review` が子タスクの結果を受けて `Manager.aggregateProject` で親を集約する。
+  - `parseSubtasks(text)`: `summary` / `subtasks` を返す。JSON が無い・`title` が空・`subtasks` が空なら ok=false。
+  - `dispatchSubtasks`: 親を `working`（`N 件に分担中`）にし、各サブタスクを `nextAssignee` で選んだ dev に
+    割り当てて `CreateSubtask` → 配送する。担当範囲を明示する一文
+    （「このサブタスクの範囲だけを担当し、他の担当者のファイルは作成しないでください。」）を `detail` に足して
+    重複を抑える。1 件も割当てられなければ親を `failed` にする。
+  - `aggregateProject`: 子の状態を集計し、全 `done` → 親 `done`（`全 N サブタスク完了`）、
+    1 つでも `failed` → 親 `failed`（要対応を通知）、それ以外は進捗ログのみ。
+- **実装（api）**: `agents.TaskCoordinator`（`CreateSubtask` / `SubtaskStatuses` / `ParentTaskID`）を
+  api が実装する（`server/internal/api/coordinator.go`）。`CreateSubtask` は親の `Mode` / `Repo` / `BaseBranch`
+  を引き継ぎ、`status=assigned` で子タスクを作成してその ID を返す（配送・割当は mgr が行う）。
+  `SubtaskStatuses` は `store.Subtasks(parentID)` を、`ParentTaskID` は `store.Task(taskID)` の `ParentID` を返す。
+- **データモデル**: `tasks.parent_id` を追加した（migration v3。`ALTER TABLE tasks ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''`
+  と `idx_tasks_parent`）。設計書 §5「カラム追加はOK」に基づく追補。親タスクは `parent_id=''`、子は親 ID を持つ。
+- **共有作業先の注意**: 同じプロジェクトを作るには**全 dev が同じ作業先を使う**必要がある。オーナーは
+  `/task -d <プロジェクトdir> <タイトル>`（またはタイトル中の絶対パス）で作業先を指定し、親タスクの
+  `Workspace` はサブタスクにも引き継がれる（`dispatchSubtasks` が親の `Task` を複製して `ID` / `Title` /
+  `Description` を差し替えるため）。
